@@ -152,7 +152,17 @@ void WifiSelectionActivity::onEnter() {
       }
     }
 
+    if (autoConnectOnly) {
+      onComplete(false);
+      return;
+    }
+
     startWifiScan(true);
+    return;
+  }
+
+  if (autoConnectOnly) {
+    onComplete(false);
     return;
   }
 
@@ -425,6 +435,11 @@ void WifiSelectionActivity::handleAutoConnectFailure() {
   LOG_DBG("WIFI", "Saved network failed: %s", selectedSSID.c_str());
   WiFi.disconnect();
 
+  if (autoConnectOnly) {
+    onComplete(false);
+    return;
+  }
+
   if (!networks.empty()) {
     if (tryNextSavedNetworkFromScan()) {
       return;
@@ -520,7 +535,7 @@ void WifiSelectionActivity::checkConnectionStatus() {
     // Sync RTC from NTP on the first successful WiFi connection only. The DS3231
     // drifts ~2 ppm so one sync is enough; users can force a re-sync from
     // Settings > Customise Status Bar > Sync clock now.
-    if (halClock.isAvailable() && !SETTINGS.clockHasBeenSynced) {
+    if (!autoConnectOnly && halClock.isAvailable() && !SETTINGS.clockHasBeenSynced) {
       if (halClock.syncFromNTP()) {
         SETTINGS.clockHasBeenSynced = 1;
         SETTINGS.saveToFile();
@@ -565,7 +580,9 @@ void WifiSelectionActivity::checkConnectionStatus() {
   }
 
   // Check for timeout
-  const unsigned long timeoutMs = autoConnecting ? AUTO_CONNECTION_TIMEOUT_MS : CONNECTION_TIMEOUT_MS;
+  const unsigned long timeoutMs = autoConnectOnly  ? AUTO_ONLY_CONNECTION_TIMEOUT_MS
+                                  : autoConnecting ? AUTO_CONNECTION_TIMEOUT_MS
+                                                   : CONNECTION_TIMEOUT_MS;
   if (millis() - connectionStartTime > timeoutMs) {
     WiFi.disconnect();
     connectionError = tr(STR_ERROR_CONNECTION_TIMEOUT);
@@ -604,7 +621,7 @@ void WifiSelectionActivity::loop() {
         onComplete(false);
         return;
       }
-      if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
+      if (!autoConnectOnly && mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
         showNetworkListFromAutoConnect();
         return;
       }
@@ -827,6 +844,10 @@ std::string WifiSelectionActivity::getSignalStrengthIndicator(const int32_t rssi
 }
 
 void WifiSelectionActivity::render(RenderLock&&) {
+  if (autoConnectOnly) {
+    return;  // Keep the reader page on-screen during the headless connection attempt.
+  }
+
   // Don't render if we're in a keyboard-entry state - we're just transitioning
   // from the keyboard subactivity back to the main activity
   if (state == WifiSelectionState::PASSWORD_ENTRY || state == WifiSelectionState::HIDDEN_SSID_ENTRY) {
