@@ -74,7 +74,12 @@ void ActivityManager::renderTaskLoop() {
 }
 
 void ActivityManager::loop() {
-  if (currentActivity) {
+  // A transition can be queued outside the current activity's loop (for
+  // example, prepareForSleep() queues an automatic sync). Do not run the
+  // outgoing activity again in that state: it may observe already-released
+  // resources and queue a conflicting transition before the replacement is
+  // applied.
+  if (pendingAction == PendingAction::None && currentActivity) {
     if (!currentActivity->isHomeActivity() && mappedInput.wasHomeGesture()) {
       if (currentActivity->handleHomeGesture()) {
         return;
@@ -244,8 +249,14 @@ void ActivityManager::goToReader(std::string path, const bool allowFastInitialRe
   }
 }
 
-void ActivityManager::goToSleep(bool fromTimeout) {
-  replaceActivity(std::make_unique<SleepActivity>(renderer, mappedInput, fromTimeout));
+void ActivityManager::showSleepScreen(const bool fromTimeout) {
+  RenderLock lock;
+  SleepActivity sleepScreen(renderer, mappedInput, fromTimeout);
+  sleepScreen.onEnter();
+}
+
+void ActivityManager::goToSleep(const bool fromTimeout, const bool renderScreen) {
+  replaceActivity(std::make_unique<SleepActivity>(renderer, mappedInput, fromTimeout, renderScreen));
   loop();  // Important: sleep screen must be rendered immediately, the caller will go to sleep right after this returns
 }
 
@@ -294,6 +305,15 @@ void ActivityManager::popActivity() {
 }
 
 bool ActivityManager::preventAutoSleep() const { return currentActivity && currentActivity->preventAutoSleep(); }
+
+bool ActivityManager::prepareForSleep(const bool fromTimeout) {
+  if (currentActivity && currentActivity->prepareForSleep(fromTimeout)) {
+    return true;
+  }
+  return std::any_of(stackActivities.rbegin(), stackActivities.rend(), [fromTimeout](const auto& activity) {
+    return activity->isReaderActivity() && activity->prepareForSleep(fromTimeout);
+  });
+}
 
 bool ActivityManager::isReaderActivity() const {
   return std::any_of(stackActivities.begin(), stackActivities.end(),
