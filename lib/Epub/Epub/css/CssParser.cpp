@@ -1,12 +1,14 @@
 #include "CssParser.h"
 
 #include <Arduino.h>
+#include <FsHelpers.h>
 #include <Logging.h>
 
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <charconv>
+#include <cmath>
 #include <cstring>
 #include <string_view>
 
@@ -48,6 +50,8 @@ constexpr size_t MIN_FREE_HEAP_FOR_CSS = 48 * 1024;
 // Maximum length for a single selector string
 // Prevents parsing of extremely long or malformed selectors
 constexpr size_t MAX_SELECTOR_LENGTH = 256;
+
+constexpr std::string_view BACKGROUND_IMAGE_FUNCTION = "url";
 
 // Check if character is CSS whitespace
 constexpr bool isCssWhitespace(const char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'; }
@@ -146,6 +150,51 @@ std::string_view stripTrailingImportant(std::string_view value) {
     value.remove_suffix(1);
   }
   return value;
+}
+
+bool hasAsciiPrefixInsensitive(const std::string_view value, const std::string_view prefix) {
+  return value.size() >= prefix.size() && iequalsAscii(value.substr(0, prefix.size()), prefix);
+}
+
+bool isLocalBackgroundPath(const std::string_view path) {
+  if (path.empty() || path.front() == '/' || path.find("//") != std::string_view::npos ||
+      path.find('\\') != std::string_view::npos) {
+    return false;
+  }
+  if (hasAsciiPrefixInsensitive(path, "data:") || hasAsciiPrefixInsensitive(path, "http:") ||
+      hasAsciiPrefixInsensitive(path, "https:") || hasAsciiPrefixInsensitive(path, "file:") ||
+      hasAsciiPrefixInsensitive(path, "javascript:")) {
+    return false;
+  }
+  // Query strings and fragments are intentionally excluded: EPUB item names
+  // are archive paths, and retaining either suffix would defeat extension and
+  // cache-path validation below.
+  return path.find_first_of("?#") == std::string_view::npos;
+}
+
+bool staysWithinArchiveRoot(const std::string_view directory, const std::string_view path) {
+  size_t depth = 0;
+  bool escaped = false;
+  const auto consume = [&depth, &escaped](const std::string_view value) {
+    size_t start = 0;
+    for (size_t i = 0; i <= value.size(); ++i) {
+      if (i != value.size() && value[i] != '/') continue;
+      const std::string_view component = value.substr(start, i - start);
+      if (component == "..") {
+        if (depth == 0) {
+          escaped = true;
+        } else {
+          --depth;
+        }
+      } else if (!component.empty() && component != ".") {
+        ++depth;
+      }
+      start = i + 1;
+    }
+  };
+  consume(directory);
+  consume(path);
+  return !escaped;
 }
 
 }  // anonymous namespace
@@ -307,12 +356,13 @@ bool CssParser::tryInterpretLength(std::string_view val, CssLength& out) {
 
 // Declaration parsing
 
-void CssParser::parseDeclarationIntoStyle(std::string_view decl, CssStyle& style) {
+void CssParser::parseDeclarationIntoStyle(const std::string_view decl, CssStyle& style,
+                                          const std::string_view stylesheetDirectory) {
   const size_t colonPos = decl.find(':');
   if (colonPos == std::string_view::npos || colonPos == 0) return;
 
   const std::string_view name = trimCssWhitespace(decl.substr(0, colonPos));
-  const std::string_view value = trimCssWhitespace(decl.substr(colonPos + 1));
+  std::string_view value = trimCssWhitespace(decl.substr(colonPos + 1));
 
   if (name.empty() || value.empty()) return;
 
@@ -409,23 +459,129 @@ void CssParser::parseDeclarationIntoStyle(std::string_view decl, CssStyle& style
       style.verticalAlign = CssVerticalAlign::Sub;
       style.defined.verticalAlign = 1;
     }
+  } else if (!stylesheetDirectory.empty() && iequalsAscii(name, "background-image")) {
+    value = stripTrailingImportant(value);
+    std::string rawPath;
+    if (iequalsAscii(value, "none")) {
+      style.backgroundImagePath = 0;
+      style.defined.backgroundImage = 1;
+    } else if (tryParseBackgroundImage(value, rawPath)) {
+      const std::string decodedPath = FsHelpers::decodeUriEscapes(rawPath);
+      const std::string resolvedPath = FsHelpers::normalisePath(std::string(stylesheetDirectory) + decodedPath);
+      if (isLocalBackgroundPath(decodedPath) && staysWithinArchiveRoot(stylesheetDirectory, decodedPath) &&
+          (FsHelpers::hasJpgExtension(resolvedPath) || FsHelpers::hasPngExtension(resolvedPath)) &&
+          !resolvedPath.empty()) {
+        const uint8_t pathIndex = registerBackgroundImagePath(resolvedPath);
+        if (pathIndex != 0) {
+          style.backgroundImagePath = pathIndex;
+          style.defined.backgroundImage = 1;
+        }
+      }
+    }
+  } else if (!stylesheetDirectory.empty() && iequalsAscii(name, "background-repeat")) {
+    const std::string_view repeatValue = stripTrailingImportant(value);
+    if (iequalsAscii(repeatValue, "no-repeat")) {
+      style.backgroundRepeat = CssBackgroundRepeat::NoRepeat;
+      style.defined.backgroundRepeat = 1;
+    } else if (iequalsAscii(repeatValue, "repeat")) {
+      style.backgroundRepeat = CssBackgroundRepeat::Repeat;
+      style.defined.backgroundRepeat = 1;
+    }
+  } else if (!stylesheetDirectory.empty() && iequalsAscii(name, "background-position")) {
+    value = stripTrailingImportant(value);
+    CssBackgroundPosition position;
+    if (tryParseBackgroundPosition(value, position)) {
+      style.backgroundPosition = position;
+    } else {
+      // A valid-but-unsupported placement must override an earlier supported
+      // declaration conservatively so the renderer omits the decoration.
+      style.backgroundPosition = CssBackgroundPosition::Unsupported;
+    }
+    style.defined.backgroundPosition = 1;
+  } else if (!stylesheetDirectory.empty() && iequalsAscii(name, "background")) {
+    // The shorthand can reset every background sub-property. We do not parse
+    // it, but marking an unsupported reset prevents stale longhand values from
+    // rendering after a later shorthand declaration.
+    style.backgroundImagePath = 0;
+    style.backgroundRepeat = CssBackgroundRepeat::Repeat;
+    style.backgroundPosition = CssBackgroundPosition::Unsupported;
+    style.defined.backgroundImage = 1;
+    style.defined.backgroundRepeat = 1;
+    style.defined.backgroundPosition = 1;
   }
 }
 
-CssStyle CssParser::parseDeclarations(std::string_view declBlock) {
+CssStyle CssParser::parseDeclarations(const std::string_view declBlock, const std::string_view stylesheetDirectory) {
   CssStyle style;
 
   size_t start = 0;
   for (size_t i = 0; i <= declBlock.size(); ++i) {
     if (i == declBlock.size() || declBlock[i] == ';') {
       if (i > start) {
-        parseDeclarationIntoStyle(declBlock.substr(start, i - start), style);
+        parseDeclarationIntoStyle(declBlock.substr(start, i - start), style, stylesheetDirectory);
       }
       start = i + 1;
     }
   }
 
   return style;
+}
+
+bool CssParser::tryParseBackgroundImage(const std::string_view val, std::string& path) {
+  const std::string_view trimmed = trimCssWhitespace(val);
+  if (trimmed.size() < 6 || !hasAsciiPrefixInsensitive(trimmed, BACKGROUND_IMAGE_FUNCTION)) return false;
+  size_t open = BACKGROUND_IMAGE_FUNCTION.size();
+  while (open < trimmed.size() && isCssWhitespace(trimmed[open])) ++open;
+  if (open >= trimmed.size() || trimmed[open] != '(' || trimmed.back() != ')') return false;
+  std::string_view inside = trimCssWhitespace(trimmed.substr(open + 1, trimmed.size() - open - 2));
+  if (inside.empty()) return false;
+  if (inside.front() == '\'' || inside.front() == '"') {
+    const char quote = inside.front();
+    if (inside.size() < 2 || inside.back() != quote) return false;
+    inside = trimCssWhitespace(inside.substr(1, inside.size() - 2));
+  } else if (inside.find_first_of("'\"") != std::string_view::npos) {
+    return false;
+  }
+  if (!isLocalBackgroundPath(inside)) return false;
+  path.assign(inside.data(), inside.size());
+  return true;
+}
+
+bool CssParser::tryParseBackgroundPosition(const std::string_view val, CssBackgroundPosition& position) {
+  std::string_view tokens[2];
+  size_t count = 0;
+  forEachDelimitedToken(trimCssWhitespace(val), isCssWhitespace, [&](const std::string_view token) {
+    if (count < 2) tokens[count++] = token;
+  });
+  if (count != 2) return false;
+
+  const bool topFirst = iequalsAscii(tokens[0], "top");
+  const bool topSecond = iequalsAscii(tokens[1], "top");
+  const std::string_view horizontal = topFirst ? tokens[1] : (topSecond ? tokens[0] : std::string_view{});
+  if (!topFirst && !topSecond) return false;
+  if (iequalsAscii(horizontal, "left")) {
+    position = CssBackgroundPosition::TopLeft;
+  } else if (iequalsAscii(horizontal, "center")) {
+    position = CssBackgroundPosition::TopCenter;
+  } else if (iequalsAscii(horizontal, "right")) {
+    position = CssBackgroundPosition::TopRight;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+uint8_t CssParser::registerBackgroundImagePath(std::string path) {
+  for (size_t i = 0; i < backgroundImagePaths_.size(); ++i) {
+    if (backgroundImagePaths_[i] == path) return static_cast<uint8_t>(i + 1);
+  }
+  if (backgroundImagePaths_.size() >= MAX_BACKGROUND_IMAGE_PATHS || path.empty() ||
+      path.size() > MAX_BACKGROUND_IMAGE_PATH_LENGTH) {
+    LOG_DBG("CSS", "Background path table full or path too long");
+    return 0;
+  }
+  backgroundImagePaths_.push_back(std::move(path));
+  return static_cast<uint8_t>(backgroundImagePaths_.size());
 }
 
 // Rule processing
@@ -492,7 +648,7 @@ void CssParser::processRuleBlockWithStyle(std::string_view selectorGroup, const 
 
 // Main parsing entry point
 
-bool CssParser::loadFromStream(HalFile& source) {
+bool CssParser::loadFromStream(HalFile& source, const std::string_view stylesheetPath) {
   if (!source) {
     LOG_ERR("CSS", "Cannot read from invalid file");
     return false;
@@ -514,6 +670,12 @@ bool CssParser::loadFromStream(HalFile& source) {
   int bodyDepth = 0;
   bool skippingRule = false;
   CssStyle currentStyle;
+  backgroundImagePaths_.reserve(BACKGROUND_IMAGE_PATH_RESERVE);
+  std::string stylesheetDirectory;
+  if (!stylesheetPath.empty()) {
+    const size_t slash = stylesheetPath.find_last_of('/');
+    if (slash != std::string_view::npos) stylesheetDirectory.assign(stylesheetPath.substr(0, slash + 1));
+  }
 
   auto handleChar = [&](const char c) {
     if (inAtRule) {
@@ -559,7 +721,7 @@ bool CssParser::loadFromStream(HalFile& source) {
       --bodyDepth;
       if (bodyDepth == 0) {
         if (!skippingRule && !declBuffer.empty()) {
-          parseDeclarationIntoStyle(declBuffer, currentStyle);
+          parseDeclarationIntoStyle(declBuffer, currentStyle, stylesheetDirectory);
         }
         if (!skippingRule) {
           processRuleBlockWithStyle(selector, currentStyle);
@@ -577,7 +739,7 @@ bool CssParser::loadFromStream(HalFile& source) {
     if (!skippingRule) {
       if (c == ';') {
         if (!declBuffer.empty()) {
-          parseDeclarationIntoStyle(declBuffer, currentStyle);
+          parseDeclarationIntoStyle(declBuffer, currentStyle, stylesheetDirectory);
           declBuffer.clear();
         }
       } else {
@@ -680,7 +842,15 @@ CssStyle CssParser::resolveStyle(std::string_view tagName, std::string_view clas
 
 // Inline style parsing (static - doesn't need rule database)
 
-CssStyle CssParser::parseInlineStyle(std::string_view styleValue) { return parseDeclarations(styleValue); }
+CssStyle CssParser::parseInlineStyle(const std::string_view styleValue) {
+  CssParser parser("");
+  return parser.parseDeclarations(styleValue);
+}
+
+std::string_view CssParser::backgroundImagePath(const CssStyle& style) const {
+  if (!style.hasBackgroundImage() || style.backgroundImagePath > backgroundImagePaths_.size()) return {};
+  return backgroundImagePaths_[style.backgroundImagePath - 1];
+}
 
 // Cache serialization
 
@@ -705,6 +875,14 @@ bool CssParser::saveToCache() const {
 
   // Write version
   file.write(CssParser::CSS_CACHE_VERSION);
+
+  const auto pathCount = static_cast<uint16_t>(backgroundImagePaths_.size());
+  file.write(reinterpret_cast<const uint8_t*>(&pathCount), sizeof(pathCount));
+  for (const auto& path : backgroundImagePaths_) {
+    const auto pathLen = static_cast<uint16_t>(path.size());
+    file.write(reinterpret_cast<const uint8_t*>(&pathLen), sizeof(pathLen));
+    file.write(reinterpret_cast<const uint8_t*>(path.data()), pathLen);
+  }
 
   // Write rule count
   const auto ruleCount = static_cast<uint16_t>(rulesBySelector_.size());
@@ -744,6 +922,9 @@ bool CssParser::saveToCache() const {
     writeLength(style.imageWidth);
     file.write(static_cast<uint8_t>(style.display));
     file.write(static_cast<uint8_t>(style.verticalAlign));
+    file.write(style.backgroundImagePath);
+    file.write(static_cast<uint8_t>(style.backgroundRepeat));
+    file.write(static_cast<uint8_t>(style.backgroundPosition));
 
     // Write defined flags as uint32_t
     uint32_t definedBits = 0;
@@ -765,6 +946,9 @@ bool CssParser::saveToCache() const {
     if (style.defined.display) definedBits |= 1 << 15;
     if (style.defined.direction) definedBits |= 1 << 16;
     if (style.defined.verticalAlign) definedBits |= 1 << 17;
+    if (style.defined.backgroundImage) definedBits |= 1u << 18;
+    if (style.defined.backgroundRepeat) definedBits |= 1u << 19;
+    if (style.defined.backgroundPosition) definedBits |= 1u << 20;
     file.write(reinterpret_cast<const uint8_t*>(&definedBits), sizeof(definedBits));
   }
 
@@ -796,6 +980,38 @@ bool CssParser::loadFromCache() {
     return false;
   }
 
+  auto hasRemainingBytes = [&file](const size_t neededBytes) {
+    return static_cast<size_t>(file.available()) >= neededBytes;
+  };
+
+  uint16_t pathCount = 0;
+  if (!hasRemainingBytes(sizeof(pathCount)) || file.read(&pathCount, sizeof(pathCount)) != sizeof(pathCount) ||
+      pathCount > MAX_BACKGROUND_IMAGE_PATHS) {
+    LOG_DBG("CSS", "Invalid background path count in cache");
+    clear();
+    return false;
+  }
+  backgroundImagePaths_.reserve(pathCount);
+  for (uint16_t i = 0; i < pathCount; ++i) {
+    uint16_t pathLen = 0;
+    if (!hasRemainingBytes(sizeof(pathLen)) || file.read(&pathLen, sizeof(pathLen)) != sizeof(pathLen) ||
+        pathLen == 0 || pathLen > MAX_BACKGROUND_IMAGE_PATH_LENGTH || !hasRemainingBytes(pathLen)) {
+      LOG_DBG("CSS", "Invalid background path length in cache");
+      clear();
+      return false;
+    }
+    std::string path(pathLen, '\0');
+    if (file.read(path.data(), pathLen) != pathLen || !isLocalBackgroundPath(path) ||
+        (!FsHelpers::hasJpgExtension(path) && !FsHelpers::hasPngExtension(path)) ||
+        FsHelpers::normalisePath(path) != path ||
+        std::find(backgroundImagePaths_.begin(), backgroundImagePaths_.end(), path) != backgroundImagePaths_.end()) {
+      LOG_DBG("CSS", "Invalid or duplicate background path in cache");
+      clear();
+      return false;
+    }
+    backgroundImagePaths_.push_back(std::move(path));
+  }
+
   // Read rule count
   uint16_t ruleCount = 0;
   if (file.read(&ruleCount, sizeof(ruleCount)) != sizeof(ruleCount)) {
@@ -811,14 +1027,10 @@ bool CssParser::loadFromCache() {
   // Size the bucket array up front to avoid incremental rehashes while loading rules.
   rulesBySelector_.reserve(ruleCount);
 
-  auto hasRemainingBytes = [&file](const size_t neededBytes) -> bool {
-    return static_cast<size_t>(file.available()) >= neededBytes;
-  };
-
   constexpr size_t CSS_LENGTH_FIELD_COUNT = 11;
   constexpr size_t CSS_LENGTH_BYTES = sizeof(float) + sizeof(uint8_t);
   constexpr size_t CSS_FIXED_STYLE_BYTES =
-      5 * sizeof(uint8_t) + (CSS_LENGTH_FIELD_COUNT * CSS_LENGTH_BYTES) + sizeof(uint8_t) + sizeof(uint32_t);
+      5 * sizeof(uint8_t) + (CSS_LENGTH_FIELD_COUNT * CSS_LENGTH_BYTES) + 5 * sizeof(uint8_t) + sizeof(uint32_t);
 
   // Read each rule
   for (uint16_t i = 0; i < ruleCount; ++i) {
@@ -861,30 +1073,50 @@ bool CssParser::loadFromCache() {
       return false;
     }
     style.textAlign = static_cast<CssTextAlign>(enumVal);
+    if (enumVal > static_cast<uint8_t>(CssTextAlign::None)) {
+      rulesBySelector_.clear();
+      return false;
+    }
 
     if (file.read(&enumVal, 1) != 1) {
       rulesBySelector_.clear();
       return false;
     }
     style.fontStyle = static_cast<CssFontStyle>(enumVal);
+    if (enumVal > static_cast<uint8_t>(CssFontStyle::Italic)) {
+      rulesBySelector_.clear();
+      return false;
+    }
 
     if (file.read(&enumVal, 1) != 1) {
       rulesBySelector_.clear();
       return false;
     }
     style.fontWeight = static_cast<CssFontWeight>(enumVal);
+    if (enumVal > static_cast<uint8_t>(CssFontWeight::Bold)) {
+      rulesBySelector_.clear();
+      return false;
+    }
 
     if (file.read(&enumVal, 1) != 1) {
       rulesBySelector_.clear();
       return false;
     }
-    style.textDecoration = static_cast<CssTextDecoration>(enumVal & CSS_TEXT_DECORATION_MASK);
+    if ((enumVal & ~CSS_TEXT_DECORATION_MASK) != 0) {
+      rulesBySelector_.clear();
+      return false;
+    }
+    style.textDecoration = static_cast<CssTextDecoration>(enumVal);
 
     if (file.read(&enumVal, 1) != 1) {
       rulesBySelector_.clear();
       return false;
     }
     style.direction = static_cast<CssTextDirection>(enumVal);
+    if (enumVal > static_cast<uint8_t>(CssTextDirection::Rtl)) {
+      rulesBySelector_.clear();
+      return false;
+    }
 
     // Read CssLength fields
     auto readLength = [&file](CssLength& len) -> bool {
@@ -893,6 +1125,9 @@ bool CssParser::loadFromCache() {
       }
       uint8_t unitVal;
       if (file.read(&unitVal, 1) != 1) {
+        return false;
+      }
+      if (unitVal > static_cast<uint8_t>(CssUnit::Percent) || !std::isfinite(len.value)) {
         return false;
       }
       len.unit = static_cast<CssUnit>(unitVal);
@@ -914,6 +1149,10 @@ bool CssParser::loadFromCache() {
       return false;
     }
     style.display = static_cast<CssDisplay>(displayVal);
+    if (displayVal > static_cast<uint8_t>(CssDisplay::None)) {
+      rulesBySelector_.clear();
+      return false;
+    }
 
     // Read verticalAlign value
     uint8_t verticalAlignVal;
@@ -922,6 +1161,26 @@ bool CssParser::loadFromCache() {
       return false;
     }
     style.verticalAlign = static_cast<CssVerticalAlign>(verticalAlignVal);
+    if (verticalAlignVal > static_cast<uint8_t>(CssVerticalAlign::Sub)) {
+      rulesBySelector_.clear();
+      return false;
+    }
+
+    if (file.read(&style.backgroundImagePath, sizeof(style.backgroundImagePath)) != sizeof(style.backgroundImagePath) ||
+        file.read(&enumVal, 1) != 1) {
+      rulesBySelector_.clear();
+      return false;
+    }
+    style.backgroundRepeat = static_cast<CssBackgroundRepeat>(enumVal);
+    if (enumVal > static_cast<uint8_t>(CssBackgroundRepeat::NoRepeat) || file.read(&enumVal, 1) != 1) {
+      rulesBySelector_.clear();
+      return false;
+    }
+    style.backgroundPosition = static_cast<CssBackgroundPosition>(enumVal);
+    if (enumVal > static_cast<uint8_t>(CssBackgroundPosition::Unsupported)) {
+      rulesBySelector_.clear();
+      return false;
+    }
 
     // Read defined flags
     uint32_t definedBits = 0;
@@ -947,8 +1206,31 @@ bool CssParser::loadFromCache() {
     style.defined.display = (definedBits & 1 << 15) != 0;
     style.defined.direction = (definedBits & 1 << 16) != 0;
     style.defined.verticalAlign = (definedBits & 1 << 17) != 0;
+    style.defined.backgroundImage = (definedBits & 1u << 18) != 0;
+    style.defined.backgroundRepeat = (definedBits & 1u << 19) != 0;
+    style.defined.backgroundPosition = (definedBits & 1u << 20) != 0;
 
-    rulesBySelector_[selector] = style;
+    constexpr uint32_t KNOWN_DEFINED_BITS = (1u << 21) - 1;
+    if ((definedBits & ~KNOWN_DEFINED_BITS) != 0 || (style.backgroundImagePath > pathCount) ||
+        (!style.defined.backgroundImage && style.backgroundImagePath != 0) ||
+        (!style.defined.backgroundRepeat && style.backgroundRepeat != CssBackgroundRepeat::Repeat) ||
+        (!style.defined.backgroundPosition && style.backgroundPosition != CssBackgroundPosition::TopLeft)) {
+      LOG_DBG("CSS", "Invalid background metadata in cache");
+      rulesBySelector_.clear();
+      return false;
+    }
+
+    if (!rulesBySelector_.emplace(std::move(selector), style).second) {
+      LOG_DBG("CSS", "Duplicate selector in cache");
+      rulesBySelector_.clear();
+      return false;
+    }
+  }
+
+  if (file.available() != 0) {
+    LOG_DBG("CSS", "Trailing bytes in cache");
+    clear();
+    return false;
   }
 
   LOG_DBG("CSS", "Loaded %u rules from cache", ruleCount);

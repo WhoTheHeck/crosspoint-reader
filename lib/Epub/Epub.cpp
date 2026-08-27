@@ -8,6 +8,8 @@
 #include <Utf8.h>
 #include <ZipFile.h>
 
+#include <utility>
+
 #include "Epub/parsers/ContainerParser.h"
 #include "Epub/parsers/ContentOpfParser.h"
 #include "Epub/parsers/TocNavParser.h"
@@ -279,7 +281,7 @@ void Epub::parseCssFiles() const {
       }
     });
   }
-  std::vector<uint64_t> seenKeys;
+  std::vector<std::pair<uint64_t, std::string>> seenKeys;
   seenKeys.reserve(cssFiles.size());
   size_t skippedDuplicates = 0;
 
@@ -287,12 +289,16 @@ void Epub::parseCssFiles() const {
   for (size_t cssIndex = 0; cssIndex < cssFiles.size(); cssIndex++) {
     const auto& cssPath = cssFiles[cssIndex];
     const uint64_t dedupKey = dedupKeys[cssIndex];
+    const std::string normalizedCssPath = FsHelpers::normalisePath(cssPath);
+    const size_t cssSlash = normalizedCssPath.find_last_of('/');
+    const std::string cssDirectory =
+        cssSlash == std::string::npos ? std::string{} : normalizedCssPath.substr(0, cssSlash + 1);
     if (dedupKey != 0) {
-      if (std::find(seenKeys.begin(), seenKeys.end(), dedupKey) != seenKeys.end()) {
+      if (std::find(seenKeys.begin(), seenKeys.end(), std::pair{dedupKey, cssDirectory}) != seenKeys.end()) {
         skippedDuplicates++;
         continue;
       }
-      seenKeys.push_back(dedupKey);
+      seenKeys.emplace_back(dedupKey, cssDirectory);
     }
     LOG_DBG("EBP", "Parsing CSS file: %s", cssPath.c_str());
 
@@ -337,7 +343,7 @@ void Epub::parseCssFiles() const {
       Storage.remove(tmpCssPath.c_str());
       continue;
     }
-    cssParser->loadFromStream(tempCssFile);
+    cssParser->loadFromStream(tempCssFile, normalizedCssPath);
     // Explicitly close() file before calling Storage.remove()
     tempCssFile.close();
     Storage.remove(tmpCssPath.c_str());

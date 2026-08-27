@@ -33,7 +33,10 @@
 class CssParser {
  public:
   // Bump when CSS cache format or rules change; section caches are invalidated when this changes
-  static constexpr uint8_t CSS_CACHE_VERSION = 8;
+  static constexpr uint8_t CSS_CACHE_VERSION = 9;
+  static constexpr uint8_t MAX_BACKGROUND_IMAGE_PATHS = 255;
+  static constexpr uint16_t MAX_BACKGROUND_IMAGE_PATH_LENGTH = 512;
+  static constexpr uint8_t BACKGROUND_IMAGE_PATH_RESERVE = 128;
 
   explicit CssParser(std::string cachePath) : cachePath(std::move(cachePath)) {}
   ~CssParser() = default;
@@ -46,9 +49,10 @@ class CssParser {
    * Load and parse CSS from a file stream.
    * Can be called multiple times to accumulate rules from multiple stylesheets.
    * @param source Open file handle to read from
+   * @param stylesheetPath EPUB-internal path used to resolve relative background URLs
    * @return true if parsing completed (even if no rules found)
    */
-  bool loadFromStream(HalFile& source);
+  bool loadFromStream(HalFile& source, std::string_view stylesheetPath = {});
 
   /**
    * Look up the style for an HTML element, considering tag name and class attributes.
@@ -67,6 +71,10 @@ class CssParser {
    */
   [[nodiscard]] static CssStyle parseInlineStyle(std::string_view styleValue);
 
+  // Resolve a style's compact path-table index. The returned view remains valid
+  // until the parser is cleared or destroyed.
+  [[nodiscard]] std::string_view backgroundImagePath(const CssStyle& style) const;
+
   /**
    * Check if any rules have been loaded
    */
@@ -80,7 +88,10 @@ class CssParser {
   /**
    * Clear all loaded rules
    */
-  void clear() { rulesBySelector_.clear(); }
+  void clear() {
+    rulesBySelector_.clear();
+    backgroundImagePaths_.clear();
+  }
 
   /**
    * Check if CSS rules cache file exists
@@ -139,13 +150,14 @@ class CssParser {
 
   // Storage: maps selector -> style properties. Hash/equal are case-insensitive.
   std::unordered_map<std::string, CssStyle, SvHash, SvEqual> rulesBySelector_;
+  std::vector<std::string> backgroundImagePaths_;
 
   std::string cachePath;
 
   // Internal parsing helpers
   void processRuleBlockWithStyle(std::string_view selectorGroup, const CssStyle& style);
-  static CssStyle parseDeclarations(std::string_view declBlock);
-  static void parseDeclarationIntoStyle(std::string_view decl, CssStyle& style);
+  CssStyle parseDeclarations(std::string_view declBlock, std::string_view stylesheetDirectory = {});
+  void parseDeclarationIntoStyle(std::string_view decl, CssStyle& style, std::string_view stylesheetDirectory);
 
   // Individual property value parsers
   static CssTextAlign interpretAlignment(std::string_view val);
@@ -155,4 +167,7 @@ class CssParser {
   static CssLength interpretLength(std::string_view val);
   /** Returns true only when a numeric length was parsed (e.g. 2em, 50%). False for auto/inherit/initial. */
   static bool tryInterpretLength(std::string_view val, CssLength& out);
+  static bool tryParseBackgroundImage(std::string_view val, std::string& path);
+  static bool tryParseBackgroundPosition(std::string_view val, CssBackgroundPosition& position);
+  uint8_t registerBackgroundImagePath(std::string path);
 };
