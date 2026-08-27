@@ -11,6 +11,7 @@
 
 #include "BookmarkEntry.h"
 #include "EpubReaderMenuActivity.h"
+#include "KOReaderSyncActivity.h"
 #include "ProgressMapper.h"
 #include "ReaderActivity.h"
 
@@ -49,6 +50,10 @@ class EpubReaderActivity final : public ReaderActivity {
   bool recentsEntryRemoved = false;
   unsigned long bookmarkMessageTime = 0UL;
   bool pendingReadFolderMove = false;
+  int sessionStartSpineIndex = -1;
+  int sessionStartPage = -1;
+  bool sessionStartPositionCaptured = false;
+  bool automaticProgressCheckPending = false;
 
   // Footnote support
   std::vector<FootnoteEntry> currentPageFootnotes;
@@ -90,7 +95,11 @@ class EpubReaderActivity final : public ReaderActivity {
   void onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction action);
   void openReaderMenu();
   void openDictionaryWordSelect();
-  bool launchKOReaderSync();
+  bool launchKOReaderSync(
+      KOReaderSyncActivity::Mode mode = KOReaderSyncActivity::Mode::MANUAL,
+      KOReaderSyncActivity::CompletionTarget completionTarget = KOReaderSyncActivity::CompletionTarget::READER);
+  bool tryAutomaticProgressUpload(KOReaderSyncActivity::CompletionTarget completionTarget);
+  void leaveReader(KOReaderSyncActivity::CompletionTarget completionTarget);
   void toggleAutoPageTurn(uint8_t selectedPageTurnOption);
   void loadCachedBookmarks();
   void addBookmark();
@@ -113,8 +122,10 @@ class EpubReaderActivity final : public ReaderActivity {
 
  public:
   explicit EpubReaderActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string bookPath,
-                              bool allowFastInitialRefresh)
-      : ReaderActivity("EpubReader", renderer, mappedInput, std::move(bookPath), allowFastInitialRefresh) {}
+                              bool allowFastInitialRefresh, bool allowAutomaticProgressCheck)
+      : ReaderActivity("EpubReader", renderer, mappedInput, std::move(bookPath), allowFastInitialRefresh,
+                       allowAutomaticProgressCheck),
+        automaticProgressCheckPending(allowAutomaticProgressCheck) {}
   ~EpubReaderActivity() override;
 
   void loop() override;
@@ -125,6 +136,8 @@ class EpubReaderActivity final : public ReaderActivity {
   void onReturnFromEndOfBook() override;
 
   bool skipLoopDelay() override;
+  bool prepareForSleep(bool fromTimeout) override;
+  bool handleHomeGesture() override;
 
   ScreenshotInfo getScreenshotInfo() const override;
   CrossPointPosition getCurrentPosition() const;

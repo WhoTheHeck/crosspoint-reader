@@ -35,8 +35,9 @@ class XtcReaderActivity final : public ReaderActivity {
 
  public:
   explicit XtcReaderActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string bookPath,
-                             bool allowFastInitialRefresh)
-      : ReaderActivity("XtcReader", renderer, mappedInput, std::move(bookPath), allowFastInitialRefresh) {}
+                             bool allowFastInitialRefresh, bool allowAutomaticProgressCheck)
+      : ReaderActivity("XtcReader", renderer, mappedInput, std::move(bookPath), allowFastInitialRefresh,
+                       allowAutomaticProgressCheck) {}
   ~XtcReaderActivity() override = default;
 
   bool pageTurn(bool isForward) override;

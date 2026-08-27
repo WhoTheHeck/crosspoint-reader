@@ -11,6 +11,10 @@
 #include <cassert>
 
 #include "Epub/Section.h"
+#include "AutomaticProgressCheckPolicy.h"
+#include "AutomaticProgressUploadPolicy.h"
+#include "AutomaticWifiConnectionPolicy.h"
+#include "DeepSleep.h"
 #include "EpubReaderUtils.h"
 #include "KOReaderCredentialStore.h"
 #include "KOReaderDocumentId.h"
@@ -46,17 +50,31 @@ const char* matchMethodName(const DocumentMatchMethod method) {
 }
 }  // namespace
 
-KOReaderSyncActivity::KOReaderSyncActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                                           const std::string& epubPath, CrossPointPosition localPosition,
-                                           SavedProgressPosition localKoPos, std::string localChapterName)
-    : Activity("KOReaderSync", renderer, mappedInput),
-      UiAppHost(renderer),
-      epubPath(epubPath),
-      localChapterName(std::move(localChapterName)),
-      localPosition(localPosition),
-      remoteProgress{},
-      remotePosition{},
-      localProgress(std::move(localKoPos)) {}
+uint32_t KOReaderSyncActivity::automaticOperationRemainingMs() const {
+  if (!automaticPush()) return AutomaticWifiConnectionPolicy::BACKGROUND_TIMEOUT_MS;
+  return AutomaticWifiConnectionPolicy::remainingBackgroundTimeMs(millis(), automaticOperationStartedAt);
+}
+
+bool KOReaderSyncActivity::automaticOperationDeadlineExpired() const {
+  return automaticPush() && automaticOperationRemainingMs() == 0;
+}
+
+KOReaderSyncClient::Error KOReaderSyncActivity::getProgress(const std::string& hash,
+                                                            KOReaderProgress& progress) {
+  if (!automaticPush()) return KOReaderSyncClient::getProgress(hash, progress);
+  const uint32_t remaining = automaticOperationRemainingMs();
+  if (remaining == 0) return KOReaderSyncClient::NETWORK_ERROR;
+  return KOReaderSyncClient::getProgress(hash, progress, remaining,
+                                         [this] { return automaticOperationDeadlineExpired(); });
+}
+
+KOReaderSyncClient::Error KOReaderSyncActivity::updateProgress(const KOReaderProgress& progress) {
+  if (!automaticPush()) return KOReaderSyncClient::updateProgress(progress);
+  const uint32_t remaining = automaticOperationRemainingMs();
+  if (remaining == 0) return KOReaderSyncClient::NETWORK_ERROR;
+  return KOReaderSyncClient::updateProgress(progress, remaining,
+                                            [this] { return automaticOperationDeadlineExpired(); });
+}
 
 void KOReaderSyncActivity::ensureEpubLoaded() {
   if (!epub) {
@@ -93,10 +111,31 @@ void KOReaderSyncActivity::saveProgressAndReturn(int spineIndex, int page) {
   returnToReader();
 }
 
-void KOReaderSyncActivity::returnToReader() { activityManager.goToReader(epubPath); }
+void KOReaderSyncActivity::returnToReader() { completeFlow(); }
+
+void KOReaderSyncActivity::completeFlow() {
+  switch (completionTarget) {
+    case CompletionTarget::HOME:
+      activityManager.goHome();
+      break;
+    case CompletionTarget::FILE_BROWSER:
+      activityManager.goToFileBrowser(epubPath);
+      break;
+    case CompletionTarget::SLEEP:
+      completeDeferredDeepSleep(false);
+      break;
+    case CompletionTarget::SLEEP_TIMEOUT:
+      completeDeferredDeepSleep(true);
+      break;
+    case CompletionTarget::READER:
+    default:
+      activityManager.goToReader(epubPath);
+      break;
+  }
+}
 
 bool KOReaderSyncActivity::smartSyncEnabled() const {
-  return KOREADER_STORE.getSyncBehavior() == KOReaderSyncBehavior::SMART;
+  return !automaticMode() && KOREADER_STORE.getSyncBehavior() == KOReaderSyncBehavior::SMART;
 }
 
 void KOReaderSyncActivity::markAutoReturn() { autoReturnAt = millis() + AUTO_RETURN_DELAY_MS; }
@@ -134,6 +173,10 @@ void KOReaderSyncActivity::performSync() {
   const DocumentMatchMethod primaryMethod = KOREADER_STORE.getMatchMethod();
   documentHash = calculateDocumentHashForMethod(epubPath, primaryMethod);
   if (documentHash.empty()) {
+    if (automaticMode()) {
+      completeFlow();
+      return;
+    }
     {
       RenderLock lock(*this);
       state = SYNC_FAILED;
@@ -154,19 +197,19 @@ void KOReaderSyncActivity::performSync() {
 
   // Fetch remote progress. In smart mode, retain the alternate document-id
   // record until both records can be mapped after the Epub is reloaded.
-  auto result = KOReaderSyncClient::getProgress(documentHash, remoteProgress);
+  auto result = getProgress(documentHash, remoteProgress);
   LOG_DBG("KOSync", "Primary remote (%s): result=%d http=%d doc=%s local=%.6f remote=%.6f xpath=%s",
           matchMethodName(primaryMethod), result, KOReaderSyncClient::lastHttpCode, documentHash.c_str(),
           localProgress.percentage, remoteProgress.percentage, remoteProgress.progress.c_str());
 
   KOReaderProgress alternateProgress;
   bool hasAlternateProgress = false;
-  if (smartSyncEnabled()) {
+  if (smartSyncEnabled() || automaticPush()) {
     const DocumentMatchMethod altMethod = alternateMatchMethod(primaryMethod);
     const std::string altHash = calculateDocumentHashForMethod(epubPath, altMethod);
     if (!altHash.empty() && altHash != documentHash) {
       KOReaderProgress altProgress;
-      const auto altResult = KOReaderSyncClient::getProgress(altHash, altProgress);
+      const auto altResult = getProgress(altHash, altProgress);
       LOG_DBG("KOSync", "Alternate remote (%s): result=%d http=%d doc=%s local=%.6f remote=%.6f xpath=%s",
               matchMethodName(altMethod), altResult, KOReaderSyncClient::lastHttpCode, altHash.c_str(),
               localProgress.percentage, altProgress.percentage, altProgress.progress.c_str());
@@ -185,6 +228,19 @@ void KOReaderSyncActivity::performSync() {
   }
 
   if (result == KOReaderSyncClient::NOT_FOUND) {
+    if (automaticPull()) {
+      completeFlow();
+      return;
+    }
+    if (automaticPush()) {
+      if (AutomaticProgressUploadPolicy::decide(localProgress.percentage, false, 0.0f) !=
+          AutomaticProgressUploadDecision::UPLOAD) {
+        completeFlow();
+        return;
+      }
+      performUpload();
+      return;
+    }
     if (smartSyncEnabled()) {
       LOG_DBG("KOSync", "Smart sync: no remote progress found for known document hashes; uploading local %.6f",
               localProgress.percentage);
@@ -203,6 +259,10 @@ void KOReaderSyncActivity::performSync() {
   }
 
   if (result != KOReaderSyncClient::OK) {
+    if (automaticMode()) {
+      completeFlow();
+      return;
+    }
     {
       RenderLock lock(*this);
       state = SYNC_FAILED;
@@ -212,10 +272,22 @@ void KOReaderSyncActivity::performSync() {
     return;
   }
 
+  if (automaticPull()) {
+    const auto decision = AutomaticProgressCheckPolicy::decide(localProgress.percentage, remoteProgress.percentage);
+    if (decision != AutomaticProgressDecision::PROMPT) {
+      completeFlow();
+      return;
+    }
+  }
+
   // Epub was released before sync to free RAM for the TLS handshake — reload it now.
   hasRemoteProgress = true;
   ensureEpubLoaded();
   if (!epub) {
+    if (automaticMode()) {
+      completeFlow();
+      return;
+    }
     {
       RenderLock lock(*this);
       state = SYNC_FAILED;
@@ -253,6 +325,36 @@ void KOReaderSyncActivity::performSync() {
     } else {
       LOG_DBG("KOSync", "Kept primary remote record after mapped-position comparison");
     }
+  }
+
+  if (automaticPush()) {
+    const CrossPointPosition* selectedRemote = &remotePosition;
+    if (hasAlternateProgress) {
+      const CrossPointPosition alternatePosition = mapRemoteProgress(alternateProgress);
+      if (MappedProgressPositionPolicy::compare(remotePosition.spineIndex, remotePosition.pageNumber,
+                                                 alternatePosition.spineIndex, alternatePosition.pageNumber) ==
+          MappedProgressPositionOrder::REMOTE_AHEAD) {
+        remotePosition = alternatePosition;
+        remoteProgress = std::move(alternateProgress);
+      }
+      selectedRemote = &remotePosition;
+    }
+    const auto mappedOrder = MappedProgressPositionPolicy::compare(
+        localPosition.spineIndex, localPosition.pageNumber, selectedRemote->spineIndex, selectedRemote->pageNumber);
+    if (mappedOrder == MappedProgressPositionOrder::INVALID ||
+        AutomaticProgressUploadPolicy::decide(localProgress.percentage, true, remoteProgress.percentage) ==
+            AutomaticProgressUploadDecision::INVALID_PROGRESS) {
+      completeFlow();
+      return;
+    }
+    if (mappedOrder != MappedProgressPositionOrder::LOCAL_AHEAD) {
+      completeFlow();
+      return;
+    }
+    documentHash = primaryHash;
+    epub.reset();
+    performUpload();
+    return;
   }
 
   const ProgressComparison comparison =

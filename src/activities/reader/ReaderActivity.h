@@ -13,12 +13,13 @@ class ReaderActivity : public Activity {
   std::string bookPath;
   int pagesUntilFullRefresh = 0;
   bool forcedRefreshPending = false;
+  bool allowAutomaticProgressCheck = false;
 
   std::unique_ptr<EndOfBookOptions> endOfBookOptions;
   std::atomic<bool> endOfBookOptionsReady{false};
 
   explicit ReaderActivity(const char* name, GfxRenderer& renderer, MappedInputManager& mappedInput,
-                          std::string bookPath, bool allowFastInitialRefresh);
+                          std::string bookPath, bool allowFastInitialRefresh, bool allowAutomaticProgressCheck);
 
   virtual bool loadBook() = 0;
   virtual std::string getBookTitle() const = 0;
@@ -45,7 +46,8 @@ class ReaderActivity : public Activity {
   ~ReaderActivity() override = default;
 
   static std::unique_ptr<ReaderActivity> create(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                                                std::string path, bool allowFastInitialRefresh);
+                                                std::string path, bool allowFastInitialRefresh,
+                                                bool allowAutomaticProgressCheck);
 
   void onEnter() override;
   void onExit() override;
