@@ -1,6 +1,7 @@
 #pragma once
 #include <Epub.h>
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -8,6 +9,7 @@
 #include "KOReaderSyncClient.h"
 #include "ProgressMapper.h"
 #include "activities/Activity.h"
+#include "activities/ActivityResult.h"
 #include "components/UiAppHost.h"
 
 /**
@@ -23,9 +25,8 @@
 class KOReaderSyncActivity final : public Activity, private UiAppHost {
  public:
   explicit KOReaderSyncActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, const std::string& epubPath,
-                                int currentSpineIndex, int currentPage, int totalPagesInSpine,
-                                SavedProgressPosition localKoPos, std::string localChapterName,
-                                std::optional<uint16_t> currentParagraphIndex = std::nullopt);
+                                CrossPointPosition localPosition, SavedProgressPosition localKoPos,
+                                std::string localChapterName);
 
   void onEnter() override;
   void onExit() override;
@@ -50,10 +51,7 @@ class KOReaderSyncActivity final : public Activity, private UiAppHost {
   std::shared_ptr<Epub> epub;  // null until lazy-loaded after TLS in performSync()
   std::string epubPath;
   std::string localChapterName;
-  int currentSpineIndex;
-  int currentPage;
-  int totalPagesInSpine;
-  std::optional<uint16_t> currentParagraphIndex;
+  CrossPointPosition localPosition;
 
   State state = WIFI_SELECTION;
   std::string statusMessage;
@@ -79,8 +77,9 @@ class KOReaderSyncActivity final : public Activity, private UiAppHost {
   // WiFi.getMode() because performUpload() calls esp_wifi_stop() on the way out,
   // which makes WiFi.getMode() return WIFI_MODE_NULL.
   bool wifiActivated = false;
+  uint32_t wifiSessionId = 0;
 
-  void onWifiSelectionComplete(bool success);
+  void onWifiSelectionComplete(WifiCompletionReason reason);
   void performSync();
   void performUpload();
   bool smartSyncEnabled() const;

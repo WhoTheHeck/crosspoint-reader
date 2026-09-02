@@ -303,6 +303,97 @@ void ChapterHtmlSlimParser::setCurrentPageVisibleOffset(const uint32_t offset) {
   currentPageVisibleOffsetSet = true;
 }
 
+bool ChapterHtmlSlimParser::addHeadingBackground(const CssStyle& cssStyle, const BlockStyle& blockStyle) {
+  if (!embeddedStyle || imageRendering != 0 || !cssParser || !cssStyle.hasBackgroundImage() ||
+      !cssStyle.hasBackgroundRepeat() || cssStyle.backgroundRepeat != CssBackgroundRepeat::NoRepeat ||
+      !cssStyle.hasBackgroundPosition() || cssStyle.backgroundPosition == CssBackgroundPosition::Unsupported) {
+    return false;
+  }
+
+  const std::string_view sourceView = cssParser->backgroundImagePath(cssStyle);
+  if (sourceView.empty()) return false;
+  const std::string sourcePath(sourceView);
+  if (!FsHelpers::hasJpgExtension(sourcePath) && !FsHelpers::hasPngExtension(sourcePath)) return false;
+
+  ImageDimensions dims = {0, 0};
+  ImageDimsProbe probe;
+  if (!epub->readItemContentsToStream(sourcePath, probe, 1024, /*allowEarlyStop=*/true) || !probe.getDimensions(dims) ||
+      dims.width == 0 || dims.height == 0) {
+    LOG_DBG("EHP", "Skipping heading background with unreadable dimensions: %s", sourcePath.c_str());
+    return false;
+  }
+
+  std::string ext;
+  const size_t extPos = sourcePath.rfind('.');
+  if (extPos != std::string::npos) ext = sourcePath.substr(extPos);
+  const std::string cachedImagePath = imageBasePath + std::to_string(imageCounter++) + ext;
+
+  const int availableWidth = std::max(1, static_cast<int>(viewportWidth) - blockStyle.totalHorizontalInset());
+  if (dims.width > availableWidth || dims.height > blockStyle.paddingTop) {
+    LOG_DBG("EHP", "Skipping oversized heading background: %s (%dx%d > %dx%d)", sourcePath.c_str(), dims.width,
+            dims.height, availableWidth, blockStyle.paddingTop);
+    return false;
+  }
+
+  const int displayWidth = dims.width;
+  const int displayHeight = dims.height;
+
+  const int lineHeight = renderer.getLineHeight(fontId, lineCompression);
+  const int requiredHeight = blockStyle.marginTop + blockStyle.paddingTop + lineHeight;
+  if (currentPage && !currentPage->elements.empty() && currentPageNextY + requiredHeight > viewportHeight) {
+    setCurrentPageVisibleOffset(visibleTextOffset);
+    completePageFn(std::move(currentPage), xpathParagraphIndex, xpathListItemIndex, currentPageVisibleOffset);
+    completedPageCount++;
+    currentPage = makeUniqueNoThrow<Page>();
+    if (!currentPage) {
+      LOG_ERR("EHP", "OOM: page for heading background");
+      return false;
+    }
+    currentPageNextY = 0;
+    currentPageVisibleOffsetSet = false;
+  } else if (!currentPage) {
+    currentPage = makeUniqueNoThrow<Page>();
+    if (!currentPage) {
+      LOG_ERR("EHP", "OOM: initial page for heading background");
+      return false;
+    }
+    currentPageNextY = 0;
+    currentPageVisibleOffsetSet = false;
+  }
+
+  const int headingTop = currentPageNextY + blockStyle.marginTop;
+  int xPos = blockStyle.leftInset();
+  switch (cssStyle.backgroundPosition) {
+    case CssBackgroundPosition::TopCenter:
+      xPos = blockStyle.leftInset() + (availableWidth - displayWidth) / 2;
+      break;
+    case CssBackgroundPosition::TopRight:
+      xPos = viewportWidth - blockStyle.rightInset() - displayWidth;
+      break;
+    case CssBackgroundPosition::TopLeft:
+      break;
+    case CssBackgroundPosition::Unsupported:
+      return false;
+  }
+  xPos = std::max(0, std::min(xPos, static_cast<int>(viewportWidth) - displayWidth));
+
+  auto imageBlock = std::shared_ptr<ImageBlock>(
+      new (std::nothrow) ImageBlock(cachedImagePath, sourcePath, displayWidth, displayHeight));
+  if (!imageBlock) {
+    LOG_ERR("EHP", "OOM: heading background image");
+    return false;
+  }
+  auto pageImage = std::shared_ptr<PageImage>(
+      new (std::nothrow) PageImage(imageBlock, static_cast<int16_t>(xPos), static_cast<int16_t>(headingTop)));
+  if (!pageImage) {
+    LOG_ERR("EHP", "OOM: heading background page element");
+    return false;
+  }
+  currentPage->elements.push_back(std::move(pageImage));
+  setCurrentPageVisibleOffset(visibleTextOffset);
+  return true;
+}
+
 // flush the contents of partWordBuffer to currentTextBlock
 void ChapterHtmlSlimParser::flushPartWordBuffer() {
   if (!currentTextBlock) {
@@ -1325,6 +1416,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
         self->blockStyleStack.back().getCombinedBlockStyle(headerBlockStyle, BlockStyle::CombineAxis::Horizontal);
     self->blockStyleStack.push_back(accumulated);
     self->startNewTextBlock(accumulated.withoutBottom());
+    self->addHeadingBackground(cssStyle, accumulated);
     self->boldUntilDepth = std::min(self->boldUntilDepth, self->depth);
     self->updateEffectiveInlineStyle();
   } else if (matches(name, BLOCK_TAGS, std::size(BLOCK_TAGS))) {

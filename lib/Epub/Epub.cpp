@@ -302,19 +302,25 @@ CssParser::ParseResult Epub::parseCssFiles(const CssParser::CacheStatus existing
 
   size_t skippedDuplicates = 0;
   CssParser::ParseResult parseResult = CssParser::ParseResult::Complete;
+  std::vector<std::pair<uint64_t, std::string>> seenKeys;
+  seenKeys.reserve(cssFiles.size());
 
   // No cache yet - parse CSS files
   for (size_t cssIndex = 0; cssIndex < cssFiles.size(); cssIndex++) {
     const auto& cssPath = cssFiles[cssIndex];
     const uint64_t dedupKey = dedupEntries ? dedupEntries[cssIndex].contentKey : 0;
+    const std::string normalizedCssPath = FsHelpers::normalisePath(cssPath);
+    const size_t cssSlash = normalizedCssPath.find_last_of('/');
+    const std::string cssDirectory =
+        cssSlash == std::string::npos ? std::string{} : normalizedCssPath.substr(0, cssSlash + 1);
     if (dedupKey != 0) {
       const bool seen =
-          std::any_of(dedupEntries.get(), dedupEntries.get() + cssIndex,
-                      [dedupKey](const CssDedupEntry& candidate) { return candidate.contentKey == dedupKey; });
+          std::find(seenKeys.begin(), seenKeys.end(), std::pair{dedupKey, cssDirectory}) != seenKeys.end();
       if (seen) {
         skippedDuplicates++;
         continue;
       }
+      seenKeys.emplace_back(dedupKey, cssDirectory);
     }
     LOG_DBG("EBP", "Parsing CSS file: %s", cssPath.c_str());
 
@@ -368,7 +374,7 @@ CssParser::ParseResult Epub::parseCssFiles(const CssParser::CacheStatus existing
       parseResult = CssParser::ParseResult::Error;
       continue;
     }
-    const CssParser::ParseResult streamResult = cssParser->loadFromStream(tempCssFile);
+    const CssParser::ParseResult streamResult = cssParser->loadFromStream(tempCssFile, normalizedCssPath);
     // Explicitly close() file before calling Storage.remove()
     tempCssFile.close();
     Storage.remove(tmpCssPath.c_str());

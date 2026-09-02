@@ -1,0 +1,38 @@
+.aud_h3 {
+  background-image: url(../Images/heading.jpg);
+  background-position: center top;
+  background-repeat: no-repeat;
+  padding: 120px 0 0;
+}
+
+.same-path {
+  background-image: url("../Images/heading.jpg");
+  background-position: top left;
+  background-repeat: no-repeat;
+}
+
+.clears-image {
+  background-image: url(../Images/heading.jpg);
+  background-image: none;
+  background-position: top left;
+  background-repeat: no-repeat;
+}
+
+.unsupported {
+  background-image: url(https://example.invalid/remote.jpg);
+  background: url(../Images/ignored.jpg) no-repeat center top;
+  background-position: bottom center;
+  background-repeat: repeat;
+}
+
+.encoded-remote {
+  background-image: url(%68%74%74%70%3A%2F%2Fexample.invalid/remote.jpg);
+}
+
+.encoded-absolute {
+  background-image: url(%2FImages/heading.jpg);
+}
+
+.excess-parent {
+  background-image: url(../../../Images/heading.jpg);
+}

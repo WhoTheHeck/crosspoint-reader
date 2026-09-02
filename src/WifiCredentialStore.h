@@ -49,6 +49,9 @@ class WifiCredentialStore : public PersistableStore<WifiCredentialStore> {
   bool addCredential(const std::string& ssid, const std::string& password);
   bool removeCredential(const std::string& ssid);
   std::optional<WifiCredential> findCredential(const std::string& ssid) const;
+  // Return the stable zero-based saved-network index without copying the
+  // credential or allocating. UNKNOWN_CREDENTIAL_INDEX means unsaved/unknown.
+  uint16_t findCredentialIndex(const std::string& ssid) const;
   std::optional<WifiCredential> getCredentialAt(size_t index) const;
   std::optional<std::string> getSsidAt(size_t index) const;
   size_t getCredentialCount() const;

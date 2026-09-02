@@ -46,6 +46,21 @@ class CssParserTest : public ::testing::Test {
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
   }
 
+  static size_t firstStyleOffset(const std::vector<uint8_t>& cache) {
+    size_t cursor = kCacheHeaderBytes;
+    uint16_t pathCount = 0;
+    std::memcpy(&pathCount, cache.data() + cursor, sizeof(pathCount));
+    cursor += sizeof(pathCount);
+    for (uint16_t i = 0; i < pathCount; ++i) {
+      uint16_t pathLength = 0;
+      std::memcpy(&pathLength, cache.data() + cursor, sizeof(pathLength));
+      cursor += sizeof(pathLength) + pathLength;
+    }
+    uint16_t selectorLength = 0;
+    std::memcpy(&selectorLength, cache.data() + cursor, sizeof(selectorLength));
+    return cursor + sizeof(selectorLength) + selectorLength;
+  }
+
   void writeCache(const std::vector<uint8_t>& bytes) const {
     std::ofstream output(cacheFile(), std::ios::binary | std::ios::trunc);
     output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
@@ -239,9 +254,7 @@ TEST_F(CssParserTest, CacheHydrationRejectsInvalidStyleEnumBytes) {
 
   const std::vector<uint8_t> validCache = readCache();
   ASSERT_GE(validCache.size(), kCacheHeaderBytes + sizeof(uint16_t));
-  uint16_t selectorLength = 0;
-  memcpy(&selectorLength, validCache.data() + kCacheHeaderBytes, sizeof(selectorLength));
-  const size_t styleOffset = kCacheHeaderBytes + sizeof(selectorLength) + selectorLength;
+  const size_t styleOffset = firstStyleOffset(validCache);
 
   std::vector<size_t> enumOffsets = {0, 1, 2, 3, 4};
   for (size_t i = 0; i < kStyleLengthFieldCount; ++i) {
@@ -270,9 +283,7 @@ TEST_F(CssParserTest, CacheHydrationRejectsNonFiniteStyleLengths) {
 
   const std::vector<uint8_t> validCache = readCache();
   ASSERT_GE(validCache.size(), kCacheHeaderBytes + sizeof(uint16_t));
-  uint16_t selectorLength = 0;
-  memcpy(&selectorLength, validCache.data() + kCacheHeaderBytes, sizeof(selectorLength));
-  const size_t firstLengthOffset = kCacheHeaderBytes + sizeof(selectorLength) + selectorLength + kStyleEnumPrefixBytes;
+  const size_t firstLengthOffset = firstStyleOffset(validCache) + kStyleEnumPrefixBytes;
 
   using LengthValue = decltype(CssLength::value);
   for (const LengthValue invalidValue :

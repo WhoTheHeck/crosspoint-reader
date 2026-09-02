@@ -14,6 +14,8 @@
 #include "WifiCredentialStore.h"
 #include "activities/util/KeyboardEntryActivity.h"
 #include "components/UITheme.h"
+#include "diagnostics/DiagnosticJournal.h"
+#include "WifiDiagnosticPolicy.h"
 #include "fontIds.h"
 
 namespace fui = freeink::ui;
@@ -22,11 +24,100 @@ namespace {
 constexpr fui::ActionId ACTION_ROW = 1;
 constexpr fui::ActionId ACTION_SCAN = 2;
 constexpr fui::ActionId ACTION_PROMPT = 3;
+uint32_t nextWifiSessionId = 0;
+uint32_t nextWifiAttemptId = 0;
+
+uint32_t allocateWifiId(uint32_t& counter) {
+  ++counter;
+  if (counter == 0) ++counter;
+  return counter;
+}
 }  // namespace
 
+#if defined(CROSSPOINT_DIAGNOSTICS_X3)
+WifiSelectionActivity::DisconnectEvent WifiSelectionActivity::disconnectRing[DISCONNECT_RING_SIZE] = {};
+volatile uint8_t WifiSelectionActivity::disconnectRingHead = 0;
+volatile uint8_t WifiSelectionActivity::disconnectRingCount = 0;
+volatile uint8_t WifiSelectionActivity::disconnectRingDropped = 0;
+portMUX_TYPE WifiSelectionActivity::disconnectRingMux = portMUX_INITIALIZER_UNLOCKED;
+WifiSelectionActivity* WifiSelectionActivity::callbackOwner = nullptr;
+#endif
+
 WifiSelectionActivity::WifiSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                                             const bool autoConnect)
-    : Activity("WifiSelection", renderer, mappedInput), UiAppHost(renderer), allowAutoConnect(autoConnect) {}
+                                             const bool autoConnect, const WifiSelectionOrigin originValue,
+                                             const uint32_t sessionIdValue)
+    : Activity("WifiSelection", renderer, mappedInput),
+      UiAppHost(renderer),
+      allowAutoConnect(autoConnect),
+      origin(originValue),
+      sessionId(sessionIdValue != 0 ? sessionIdValue : allocateWifiId(nextWifiSessionId)) {}
+
+#if defined(CROSSPOINT_DIAGNOSTICS_X3)
+void WifiSelectionActivity::onWifiSystemEvent(arduino_event_t* event) {
+  if (event == nullptr || event->event_id != ARDUINO_EVENT_WIFI_STA_DISCONNECTED) return;
+  portENTER_CRITICAL(&disconnectRingMux);
+  if (callbackOwner == nullptr) {
+    portEXIT_CRITICAL(&disconnectRingMux);
+    return;
+  }
+  if (disconnectRingCount == DISCONNECT_RING_SIZE) {
+    disconnectRingHead = static_cast<uint8_t>((disconnectRingHead + 1) % DISCONNECT_RING_SIZE);
+    --disconnectRingCount;
+    if (disconnectRingDropped != UINT8_MAX) ++disconnectRingDropped;
+  }
+  const uint8_t slot = static_cast<uint8_t>((disconnectRingHead + disconnectRingCount) % DISCONNECT_RING_SIZE);
+  disconnectRing[slot] = {
+      static_cast<uint16_t>(event->event_info.wifi_sta_disconnected.reason),
+      millis(),
+      callbackOwner->attemptId,
+      static_cast<uint8_t>(callbackOwner->attemptMode),
+  };
+  ++disconnectRingCount;
+  portEXIT_CRITICAL(&disconnectRingMux);
+}
+
+void WifiSelectionActivity::drainDisconnectEvents() {
+  uint8_t dropped = 0;
+  portENTER_CRITICAL(&disconnectRingMux);
+  dropped = disconnectRingDropped;
+  disconnectRingDropped = 0;
+  portEXIT_CRITICAL(&disconnectRingMux);
+
+  bool droppedReported = false;
+  while (true) {
+    DisconnectEvent event;
+    portENTER_CRITICAL(&disconnectRingMux);
+    if (disconnectRingCount == 0) {
+      portEXIT_CRITICAL(&disconnectRingMux);
+      break;
+    }
+    // The head always names the oldest queued item; insertion advances it
+    // only when the ring is full and overwrites that item.
+    const uint8_t oldest = disconnectRingHead;
+    event = disconnectRing[oldest];
+    --disconnectRingCount;
+    portEXIT_CRITICAL(&disconnectRingMux);
+
+    // Driver status is intentionally sampled here, in task context, rather
+    // than from the framework callback.
+    const uint16_t status = static_cast<uint16_t>(WiFi.status());
+    const uint32_t elapsed = event.attemptId == attemptId ? millis() - connectionStartTime : 0;
+    const uint8_t eventDropped = droppedReported ? 0 : dropped;
+    if (event.attemptId == attemptId) {
+      latestDisconnectReason = event.reason;
+      latestDisconnectReasonKnown = true;
+    }
+    if (!diagnosticJournal.recordWifiDriverDisconnect(event.attemptId, sessionId, event.reason, status, elapsed,
+                                                      event.callbackUptimeMs, event.mode, eventDropped)) {
+      LOG_ERR("DIAG", "WiFi disconnect diagnostic record failed");
+    }
+    droppedReported = true;
+  }
+  if (dropped > 0 && !droppedReported && !diagnosticJournal.recordQueueOverflow(sessionId, dropped)) {
+    LOG_ERR("DIAG", "WiFi callback overflow record failed");
+  }
+}
+#endif
 
 void WifiSelectionActivity::onRowEvent(const fui::ActionEvent& event, void* user) {
   auto* self = static_cast<WifiSelectionActivity*>(user);
@@ -88,6 +179,18 @@ void WifiSelectionActivity::onPromptEvent(const fui::ActionEvent& event, void* u
 void WifiSelectionActivity::onEnter() {
   Activity::onEnter();
 
+#if defined(CROSSPOINT_DIAGNOSTICS_X3)
+  portENTER_CRITICAL(&disconnectRingMux);
+  disconnectRingHead = 0;
+  disconnectRingCount = 0;
+  disconnectRingDropped = 0;
+  callbackOwner = this;
+  portEXIT_CRITICAL(&disconnectRingMux);
+  disconnectCallbackHandle =
+      WiFi.onEvent(&WifiSelectionActivity::onWifiSystemEvent, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+  disconnectCallbackRegistered = true;
+#endif
+
   // Load saved WiFi credentials - SD card operations need lock as we use SPI
   // for both
   {
@@ -112,6 +215,16 @@ void WifiSelectionActivity::onEnter() {
   autoConnecting = false;
   manualNetworkListRequested = false;
   autoAttemptedSsids.clear();
+  attemptId = 0;
+  attemptMode = WifiAttemptMode::Manual;
+  latestDisconnectReason = 0xffff;
+  latestDisconnectReasonKnown = false;
+  presentationId = 0;
+  confirmRequestedWhileScanning = false;
+  pendingFallbackCause = false;
+  pendingFallbackTrigger = 0;
+  attemptIsLastConnectedSsid = false;
+  lastConnectedCandidate.clear();
   const size_t savedCredentialCount = WIFI_STORE.getCredentialCount();
   autoAttemptedSsids.reserve(savedCredentialCount);
 
@@ -144,9 +257,9 @@ void WifiSelectionActivity::onEnter() {
   // network first for speed, then scan and try any visible saved networks by
   // signal strength. The user can interrupt this and show the scan result.
   if (allowAutoConnect && savedCredentialCount != 0) {
-    const std::string lastSsid = WIFI_STORE.getLastConnectedSsid();
-    if (!lastSsid.empty()) {
-      const auto cred = WIFI_STORE.findCredential(lastSsid);
+    lastConnectedCandidate = WIFI_STORE.getLastConnectedSsid();
+    if (!lastConnectedCandidate.empty()) {
+      const auto cred = WIFI_STORE.findCredential(lastConnectedCandidate);
       if (cred && tryAutoConnectCredential(*cred)) {
         return;
       }
@@ -161,6 +274,16 @@ void WifiSelectionActivity::onEnter() {
 }
 
 void WifiSelectionActivity::onExit() {
+#if defined(CROSSPOINT_DIAGNOSTICS_X3)
+  if (disconnectCallbackRegistered) {
+    WiFi.removeEvent(disconnectCallbackHandle);
+    disconnectCallbackRegistered = false;
+  }
+  portENTER_CRITICAL(&disconnectRingMux);
+  if (callbackOwner == this) callbackOwner = nullptr;
+  portEXIT_CRITICAL(&disconnectRingMux);
+#endif
+
   Activity::onExit();
 
   LOG_DBG("WIFI", "Free heap at onExit start: %d bytes", ESP.getFreeHeap());
@@ -206,14 +329,19 @@ void WifiSelectionActivity::processWifiScanResults() {
   }
 
   if (scanResult == WIFI_SCAN_FAILED) {
+    const bool wasAutomatic = autoConnecting;
+#if defined(CROSSPOINT_DIAGNOSTICS_X3)
+    if (!diagnosticJournal.recordWifiScanFailed(sessionId, scanResult)) {
+      LOG_ERR("DIAG", "WiFi scan failure diagnostic record failed");
+    }
+#endif
     networks.clear();
     realNetworkCount = 0;
     appendHiddenNetworkEntry();
     rebuildNetworkRowItems();
-    autoConnecting = false;
-    state = WifiSelectionState::NETWORK_LIST;
-    selectedNetworkIndex = 0;
-    requestUpdate();
+    const uint8_t trigger = diagnostics::selectFallbackTrigger(confirmRequestedWhileScanning, true, false,
+                                                               diagnostics::FALLBACK_SCAN_FAILURE);
+    presentNetworkList(wasAutomatic || confirmRequestedWhileScanning, trigger);
     return;
   }
 
@@ -264,10 +392,10 @@ void WifiSelectionActivity::processWifiScanResults() {
     return;
   }
 
-  autoConnecting = false;
-  state = WifiSelectionState::NETWORK_LIST;
-  selectedNetworkIndex = 0;
-  requestUpdate();
+  const bool wasAutomatic = autoConnecting;
+  const uint8_t trigger = diagnostics::selectFallbackTrigger(confirmRequestedWhileScanning, false, pendingFallbackCause,
+                                                             pendingFallbackTrigger);
+  presentNetworkList(wasAutomatic || confirmRequestedWhileScanning, trigger);
 }
 
 void WifiSelectionActivity::appendHiddenNetworkEntry() {
@@ -279,6 +407,30 @@ void WifiSelectionActivity::appendHiddenNetworkEntry() {
   placeholder.hasSavedPassword = false;
   placeholder.isHiddenPlaceholder = true;
   networks.push_back(std::move(placeholder));
+}
+
+void WifiSelectionActivity::presentNetworkList(const bool automatic, const uint8_t fallbackTrigger) {
+  if (automatic) {
+    ++presentationId;
+    if (presentationId == 0) ++presentationId;
+#if defined(CROSSPOINT_DIAGNOSTICS_X3)
+    if (!diagnosticJournal.recordWifiListFallback(sessionId, presentationId,
+                                                  static_cast<DiagnosticJournal::FallbackTrigger>(fallbackTrigger))) {
+      LOG_ERR("DIAG", "WiFi list fallback diagnostic record failed");
+    }
+#endif
+  }
+  pendingFallbackCause = false;
+  confirmRequestedWhileScanning = false;
+  autoConnecting = false;
+  state = WifiSelectionState::NETWORK_LIST;
+  selectedNetworkIndex = 0;
+  requestUpdate();
+}
+
+void WifiSelectionActivity::carryFallbackCause(const uint8_t fallbackTrigger) {
+  pendingFallbackCause = true;
+  pendingFallbackTrigger = fallbackTrigger;
 }
 
 // Derives networkStatuses/networkRowItems from `networks`. Called whenever
@@ -401,6 +553,7 @@ bool WifiSelectionActivity::tryAutoConnectCredential(const WifiCredential& cred)
   selectedRequiresPassword = !cred.password.empty();
   usedSavedPassword = true;
   autoConnecting = true;
+  attemptIsLastConnectedSsid = cred.ssid == lastConnectedCandidate;
   manualNetworkListRequested = false;
   attemptConnection();
   requestUpdate();
@@ -429,10 +582,8 @@ void WifiSelectionActivity::handleAutoConnectFailure() {
     if (tryNextSavedNetworkFromScan()) {
       return;
     }
-    autoConnecting = false;
-    state = WifiSelectionState::NETWORK_LIST;
-    selectedNetworkIndex = 0;
-    requestUpdate();
+    presentNetworkList(true,
+                       diagnostics::selectFallbackTrigger(false, false, pendingFallbackCause, pendingFallbackTrigger));
     return;
   }
 
@@ -444,16 +595,16 @@ void WifiSelectionActivity::showNetworkListFromAutoConnect() {
   WiFi.disconnect();
   autoConnecting = false;
   manualNetworkListRequested = true;
+  confirmRequestedWhileScanning = true;
 
   if (networks.empty()) {
     startWifiScan(false);
     manualNetworkListRequested = true;
+    confirmRequestedWhileScanning = true;
     return;
   }
 
-  state = WifiSelectionState::NETWORK_LIST;
-  selectedNetworkIndex = 0;
-  requestUpdate();
+  presentNetworkList(true, diagnostics::FALLBACK_USER_CONFIRM);
 }
 
 void WifiSelectionActivity::attemptConnection() {
@@ -485,6 +636,25 @@ void WifiSelectionActivity::attemptConnection() {
     LOG_ERR("WIFI", "Failed to read station MAC for hostname (err=%d)", static_cast<int>(macResult));
   }
 
+  // Assign identity immediately before the framework call. The callback copies
+  // this identity and never consults the mutable autoConnecting flag.
+#if defined(CROSSPOINT_DIAGNOSTICS_X3)
+  portENTER_CRITICAL(&disconnectRingMux);
+#endif
+  attemptId = allocateWifiId(nextWifiAttemptId);
+  attemptMode = autoConnecting ? WifiAttemptMode::Automatic : WifiAttemptMode::Manual;
+  latestDisconnectReason = 0xffff;
+  latestDisconnectReasonKnown = false;
+#if defined(CROSSPOINT_DIAGNOSTICS_X3)
+  portEXIT_CRITICAL(&disconnectRingMux);
+  if (attemptMode == WifiAttemptMode::Automatic &&
+      !diagnosticJournal.recordWifiAutoStart(attemptId, sessionId, WIFI_STORE.findCredentialIndex(selectedSSID),
+                                             attemptIsLastConnectedSsid, static_cast<uint8_t>(attemptMode),
+                                             static_cast<uint8_t>(origin))) {
+    LOG_ERR("DIAG", "WiFi auto-start diagnostic record failed");
+  }
+#endif
+
   if (selectedRequiresPassword && !enteredPassword.empty()) {
     WiFi.begin(selectedSSID.c_str(), enteredPassword.c_str());
   } else {
@@ -505,6 +675,15 @@ void WifiSelectionActivity::checkConnectionStatus() {
     char ipStr[16];
     snprintf(ipStr, sizeof(ipStr), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
     connectedIP = ipStr;
+    const uint32_t elapsedMs = millis() - connectionStartTime;
+#if defined(CROSSPOINT_DIAGNOSTICS_X3)
+    if (!diagnosticJournal.recordWifiConnected(attemptId, sessionId, elapsedMs, static_cast<int16_t>(WiFi.RSSI()),
+                                               static_cast<uint8_t>(WiFi.channel()), usedSavedPassword,
+                                               WIFI_STORE.findCredentialIndex(selectedSSID),
+                                               static_cast<uint8_t>(attemptMode), static_cast<uint8_t>(origin))) {
+      LOG_ERR("DIAG", "WiFi connected diagnostic record failed");
+    }
+#endif
     autoConnecting = false;
 
 #if defined(ENABLE_SERIAL_LOG) && LOG_LEVEL >= 2
@@ -556,6 +735,15 @@ void WifiSelectionActivity::checkConnectionStatus() {
       connectionError = tr(STR_ERROR_NETWORK_NOT_FOUND);
     }
     if (autoConnecting) {
+#if defined(CROSSPOINT_DIAGNOSTICS_X3)
+      if (!diagnosticJournal.recordWifiAutoFailure(
+              attemptId, sessionId, static_cast<uint16_t>(status), millis() - connectionStartTime,
+              diagnostics::latestDisconnectReason(latestDisconnectReasonKnown, latestDisconnectReason),
+              static_cast<uint8_t>(attemptMode))) {
+        LOG_ERR("DIAG", "WiFi auto-failure diagnostic record failed");
+      }
+#endif
+      carryFallbackCause(diagnostics::FALLBACK_DRIVER_FAILURE);
       handleAutoConnectFailure();
       return;
     }
@@ -567,6 +755,17 @@ void WifiSelectionActivity::checkConnectionStatus() {
   // Check for timeout
   const unsigned long timeoutMs = autoConnecting ? AUTO_CONNECTION_TIMEOUT_MS : CONNECTION_TIMEOUT_MS;
   if (millis() - connectionStartTime > timeoutMs) {
+    if (autoConnecting) {
+#if defined(CROSSPOINT_DIAGNOSTICS_X3)
+      if (!diagnosticJournal.recordWifiAutoTimeout(
+              attemptId, sessionId, static_cast<uint16_t>(status), millis() - connectionStartTime,
+              diagnostics::latestDisconnectReason(latestDisconnectReasonKnown, latestDisconnectReason),
+              static_cast<uint8_t>(attemptMode))) {
+        LOG_ERR("DIAG", "WiFi auto-timeout diagnostic record failed");
+      }
+#endif
+      carryFallbackCause(diagnostics::FALLBACK_TIMEOUT);
+    }
     WiFi.disconnect();
     connectionError = tr(STR_ERROR_CONNECTION_TIMEOUT);
     if (autoConnecting) {
@@ -580,6 +779,12 @@ void WifiSelectionActivity::checkConnectionStatus() {
 }
 
 void WifiSelectionActivity::loop() {
+#if defined(CROSSPOINT_DIAGNOSTICS_X3)
+  // Driver callbacks only enqueue fixed metadata; all status reads and SD I/O
+  // happen here in the activity task.
+  drainDisconnectEvents();
+#endif
+
   // Check scan progress
   if (state == WifiSelectionState::SCANNING) {
     if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
@@ -590,6 +795,7 @@ void WifiSelectionActivity::loop() {
     if (autoConnecting && mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
       autoConnecting = false;
       manualNetworkListRequested = true;
+      confirmRequestedWhileScanning = true;
       requestUpdate();
     }
     processWifiScanResults();
@@ -1104,9 +1310,14 @@ void WifiSelectionActivity::renderConnectionFailed(const Rect* screen, const The
 void WifiSelectionActivity::onComplete(const bool connected) {
   ActivityResult result;
   result.isCancelled = !connected;
+  WifiResult wifiResult;
+  wifiResult.connected = connected;
+  wifiResult.reason = connected ? WifiCompletionReason::Connected : WifiCompletionReason::UserCancelled;
   if (connected) {
-    result.data = WifiResult{true, selectedSSID, connectedIP};
+    wifiResult.ssid = selectedSSID;
+    wifiResult.ip = connectedIP;
   }
+  result.data = std::move(wifiResult);
   setResult(std::move(result));
   finish();
 }

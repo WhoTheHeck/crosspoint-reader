@@ -9,19 +9,21 @@
 
 #include <algorithm>
 #include <cassert>
-#include <cmath>
 
 #include "Epub/Section.h"
 #include "EpubReaderUtils.h"
 #include "KOReaderCredentialStore.h"
 #include "KOReaderDocumentId.h"
 #include "MappedInputManager.h"
+#include "ProgressComparison.h"
 #include "ReaderUtils.h"
 #include "SilentRestart.h"
 #include "activities/ActivityManager.h"
 #include "activities/network/WifiSelectionActivity.h"
 #include "components/UITheme.h"
 #include "components/UiAppHelpers.h"  // list icons for the compare rows
+#include "diagnostics/DiagnosticJournal.h"
+#include "WifiDiagnosticPolicy.h"
 #include "fontIds.h"
 
 namespace fui = freeink::ui;
@@ -31,6 +33,7 @@ namespace {
 // and the upload button (NO_REMOTE_PROGRESS) never coexist, so state
 // disambiguates them in the handler.
 constexpr fui::ActionId ACTION_ROW = 1;
+uint32_t nextKosyncSessionId = 0;
 
 std::string calculateDocumentHashForMethod(const std::string& path, const DocumentMatchMethod method) {
   return method == DocumentMatchMethod::FILENAME ? KOReaderDocumentId::calculateFromFilename(path)
@@ -48,20 +51,19 @@ const char* matchMethodName(const DocumentMatchMethod method) {
 }  // namespace
 
 KOReaderSyncActivity::KOReaderSyncActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                                           const std::string& epubPath, int currentSpineIndex, int currentPage,
-                                           int totalPagesInSpine, SavedProgressPosition localKoPos,
-                                           std::string localChapterName, std::optional<uint16_t> currentParagraphIndex)
+                                           const std::string& epubPath, CrossPointPosition localPosition,
+                                           SavedProgressPosition localKoPos, std::string localChapterName)
     : Activity("KOReaderSync", renderer, mappedInput),
       UiAppHost(renderer),
       epubPath(epubPath),
       localChapterName(std::move(localChapterName)),
-      currentSpineIndex(currentSpineIndex),
-      currentPage(currentPage),
-      totalPagesInSpine(totalPagesInSpine),
-      currentParagraphIndex(currentParagraphIndex),
+      localPosition(localPosition),
       remoteProgress{},
       remotePosition{},
-      localProgress(std::move(localKoPos)) {}
+      localProgress(std::move(localKoPos)),
+      wifiSessionId(++nextKosyncSessionId) {
+  if (wifiSessionId == 0) wifiSessionId = ++nextKosyncSessionId;
+}
 
 void KOReaderSyncActivity::ensureEpubLoaded() {
   if (!epub) {
@@ -115,8 +117,13 @@ void KOReaderSyncActivity::completeAlreadySynced() {
   requestUpdate(true);
 }
 
-void KOReaderSyncActivity::onWifiSelectionComplete(const bool success) {
-  if (!success) {
+void KOReaderSyncActivity::onWifiSelectionComplete(const WifiCompletionReason reason) {
+  if (reason != WifiCompletionReason::Connected) {
+#if defined(CROSSPOINT_DIAGNOSTICS_X3)
+    diagnosticJournal.recordKosyncWifiResult(
+        wifiSessionId, static_cast<DiagnosticJournal::KosyncResult>(
+                           diagnostics::kosyncResultCode(false, reason == WifiCompletionReason::UserCancelled)));
+#endif
     LOG_DBG("KOSync", "WiFi connection failed, exiting");
     returnToReader();
     return;
@@ -138,6 +145,10 @@ void KOReaderSyncActivity::onWifiSelectionComplete(const bool success) {
   requestUpdate(true);
 
   // KOSync requests from CrossPoint do not include a client timestamp.
+#if defined(CROSSPOINT_DIAGNOSTICS_X3)
+  diagnosticJournal.recordKosyncWifiResult(
+      wifiSessionId, static_cast<DiagnosticJournal::KosyncResult>(diagnostics::kosyncResultCode(true, false)));
+#endif
   performSync();
 }
 
@@ -163,15 +174,15 @@ void KOReaderSyncActivity::performSync() {
   }
   requestUpdateAndWait();
 
-  // Fetch remote progress. In smart mode, also probe the alternate document-id
-  // method and use the furthest remote state we can find. This avoids a stale
-  // local upload when another KOReader device synced the same book with a
-  // different document matching method.
+  // Fetch remote progress. In smart mode, retain the alternate document-id
+  // record until both records can be mapped after the Epub is reloaded.
   auto result = KOReaderSyncClient::getProgress(documentHash, remoteProgress);
   LOG_DBG("KOSync", "Primary remote (%s): result=%d http=%d doc=%s local=%.6f remote=%.6f xpath=%s",
           matchMethodName(primaryMethod), result, KOReaderSyncClient::lastHttpCode, documentHash.c_str(),
           localProgress.percentage, remoteProgress.percentage, remoteProgress.progress.c_str());
 
+  KOReaderProgress alternateProgress;
+  bool hasAlternateProgress = false;
   if (smartSyncEnabled()) {
     const DocumentMatchMethod altMethod = alternateMatchMethod(primaryMethod);
     const std::string altHash = calculateDocumentHashForMethod(epubPath, altMethod);
@@ -182,13 +193,17 @@ void KOReaderSyncActivity::performSync() {
               matchMethodName(altMethod), altResult, KOReaderSyncClient::lastHttpCode, altHash.c_str(),
               localProgress.percentage, altProgress.percentage, altProgress.progress.c_str());
 
-      if (altResult == KOReaderSyncClient::OK &&
-          (result == KOReaderSyncClient::NOT_FOUND || altProgress.percentage > remoteProgress.percentage)) {
-        documentHash = altHash;
-        remoteProgress = std::move(altProgress);
-        result = KOReaderSyncClient::OK;
+      if (altResult == KOReaderSyncClient::OK) {
+        alternateProgress = std::move(altProgress);
+        hasAlternateProgress = true;
       }
     }
+  }
+
+  if (result == KOReaderSyncClient::NOT_FOUND && hasAlternateProgress) {
+    remoteProgress = std::move(alternateProgress);
+    hasAlternateProgress = false;
+    result = KOReaderSyncClient::OK;
   }
 
   if (result == KOReaderSyncClient::NOT_FOUND) {
@@ -232,40 +247,56 @@ void KOReaderSyncActivity::performSync() {
     return;
   }
 
-  // The standard KOReader progress XPath is the authoritative content anchor.
-  // The CrossPoint server's existing rich page hints remain a legacy fallback.
-  SavedProgressPosition koPos = {remoteProgress.progress, remoteProgress.percentage};
-  remotePosition = ProgressMapper::toCrossPoint(epub, koPos, renderer, currentSpineIndex, totalPagesInSpine);
-  if (!remotePosition.hasVisibleTextOffset && remoteProgress.position.has_value()) {
-    // toCrossPoint above already tried koPos.xpath; if the rich position carries the same XPath,
-    // tell fromRichPosition to skip re-resolving it and use its page hints directly.
-    const bool sameXPath = remoteProgress.position->xpath == remoteProgress.progress;
-    if (const auto richMapped = ProgressMapper::fromRichPosition(epub, *remoteProgress.position, renderer, sameXPath)) {
-      remotePosition = *richMapped;
+  const auto mapRemoteProgress = [&](const KOReaderProgress& progress) {
+    // The standard KOReader progress XPath is the authoritative content anchor.
+    // The CrossPoint server's existing rich page hints remain a legacy fallback.
+    const SavedProgressPosition koPos = {progress.progress, progress.percentage};
+    CrossPointPosition mapped =
+        ProgressMapper::toCrossPoint(epub, koPos, renderer, localPosition.spineIndex, localPosition.totalPages);
+    if (!mapped.hasVisibleTextOffset && progress.position.has_value()) {
+      // toCrossPoint above already tried koPos.xpath; if the rich position carries the same XPath,
+      // tell fromRichPosition to skip re-resolving it and use its page hints directly.
+      const bool sameXPath = progress.position->xpath == progress.progress;
+      if (const auto richMapped = ProgressMapper::fromRichPosition(epub, *progress.position, renderer, sameXPath)) {
+        mapped = *richMapped;
+      }
+    }
+    return mapped;
+  };
+
+  remotePosition = mapRemoteProgress(remoteProgress);
+  if (hasAlternateProgress) {
+    const CrossPointPosition alternatePosition = mapRemoteProgress(alternateProgress);
+    if (selectRemoteRecord(remotePosition, remoteProgress.percentage, alternatePosition,
+                           alternateProgress.percentage) == RemoteRecordChoice::Alternate) {
+      remoteProgress = std::move(alternateProgress);
+      remotePosition = alternatePosition;
+      LOG_DBG("KOSync", "Selected alternate remote record after mapped-position comparison");
+    } else {
+      LOG_DBG("KOSync", "Kept primary remote record after mapped-position comparison");
     }
   }
 
+  const ProgressComparison comparison =
+      compareProgress(localPosition, localProgress.percentage, remotePosition, remoteProgress.percentage);
   if (smartSyncEnabled()) {
-    static constexpr float SAME_PROGRESS_EPSILON = 0.001f;  // 0.1 percentage points
-    const float delta = localProgress.percentage - remoteProgress.percentage;
-    LOG_DBG("KOSync", "Smart decision: doc=%s local=%.6f remote=%.6f delta=%.6f remoteXpath=%s mapped=%d/%d",
-            documentHash.c_str(), localProgress.percentage, remoteProgress.percentage, delta,
+    LOG_DBG("KOSync", "Smart decision: doc=%s result=%d local=%.6f remote=%.6f remoteXpath=%s mapped=%d/%d",
+            primaryHash.c_str(), static_cast<int>(comparison), localProgress.percentage, remoteProgress.percentage,
             remoteProgress.progress.c_str(), remotePosition.spineIndex, remotePosition.pageNumber);
-    if (std::fabs(delta) <= SAME_PROGRESS_EPSILON) {
-      completeAlreadySynced();
-      return;
+    switch (comparison) {
+      case ProgressComparison::Synchronized:
+        completeAlreadySynced();
+        return;
+      case ProgressComparison::LocalAhead:
+        performUpload();
+        return;
+      case ProgressComparison::RemoteAhead:
+        saveProgressAndReturn(remotePosition.spineIndex, remotePosition.pageNumber);
+        return;
+      case ProgressComparison::Unknown:
+        LOG_DBG("KOSync", "Smart sync comparison unknown; opening manual selection");
+        break;
     }
-
-    if (delta > 0) {
-      // Alternate hashes are only probes for newer remote state. Keep uploads
-      // on the user's configured matching method so its primary record heals.
-      documentHash = primaryHash;
-      performUpload();
-      return;
-    }
-
-    saveProgressAndReturn(remotePosition.spineIndex, remotePosition.pageNumber);
-    return;
   }
 
   // localProgress was pre-computed in EpubReaderActivity before the Epub was released.
@@ -273,12 +304,7 @@ void KOReaderSyncActivity::performSync() {
     RenderLock lock(*this);
     state = SHOWING_RESULT;
 
-    // Default to the option that corresponds to the furthest progress
-    if (localProgress.percentage > remoteProgress.percentage) {
-      selectedOption = 1;  // Upload local progress
-    } else {
-      selectedOption = 0;  // Apply remote progress
-    }
+    selectedOption = comparison == ProgressComparison::LocalAhead ? 1 : 0;
   }
   requestUpdate(true);
 }
@@ -306,10 +332,12 @@ void KOReaderSyncActivity::performUpload() {
                       : localProgress.percentage > 1.0f ? 1.0f
                                                         : localProgress.percentage;
     pos.pctQ = static_cast<uint32_t>(pct * 1000000.0f + 0.5f);
-    pos.spineIndex = static_cast<uint16_t>(currentSpineIndex);
-    pos.pageNumber = static_cast<uint16_t>(currentPage);
-    pos.totalPages = static_cast<uint16_t>(totalPagesInSpine > 0 ? totalPagesInSpine : 1);
-    pos.paragraphIndex = currentParagraphIndex;
+    pos.spineIndex = static_cast<uint16_t>(localPosition.spineIndex);
+    pos.pageNumber = static_cast<uint16_t>(localPosition.pageNumber);
+    pos.totalPages = static_cast<uint16_t>(localPosition.totalPages > 0 ? localPosition.totalPages : 1);
+    if (localPosition.hasParagraphIndex) {
+      pos.paragraphIndex = localPosition.paragraphIndex;
+    }
     pos.xpath = localProgress.xpath;
     progress.position = std::move(pos);
   }
@@ -371,6 +399,10 @@ void KOReaderSyncActivity::onEnter() {
   // Check for credentials first
   if (!KOREADER_STORE.hasCredentials()) {
     state = NO_CREDENTIALS;
+#if defined(CROSSPOINT_DIAGNOSTICS_X3)
+    diagnosticJournal.recordKosyncWifiResult(
+        wifiSessionId, static_cast<DiagnosticJournal::KosyncResult>(diagnostics::kosyncResultCode(false, false)));
+#endif
     requestUpdate();
     return;
   }
@@ -381,14 +413,21 @@ void KOReaderSyncActivity::onEnter() {
   // Check if already connected (e.g. from settings page auth)
   if (WiFi.status() == WL_CONNECTED) {
     LOG_DBG("KOSync", "Already connected to WiFi");
-    onWifiSelectionComplete(true);
+    onWifiSelectionComplete(WifiCompletionReason::Connected);
     return;
   }
 
   // Launch WiFi selection subactivity
   LOG_DBG("KOSync", "Launching WifiSelectionActivity...");
-  startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput),
-                         [this](const ActivityResult& result) { onWifiSelectionComplete(!result.isCancelled); });
+  startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput, true,
+                                                                 WifiSelectionOrigin::KOReaderSync, wifiSessionId),
+                         [this](const ActivityResult& result) {
+                           if (!std::holds_alternative<WifiResult>(result.data)) {
+                             onWifiSelectionComplete(WifiCompletionReason::Failed);
+                             return;
+                           }
+                           onWifiSelectionComplete(std::get<WifiResult>(result.data).reason);
+                         });
 }
 
 void KOReaderSyncActivity::onExit() {
@@ -452,16 +491,20 @@ void KOReaderSyncActivity::buildResultScreen(UiScreen& screen) {
     const std::string remoteChapter =
         (remoteTocIndex >= 0) ? epub->getTocItem(remoteTocIndex).title
                               : (std::string(tr(STR_SECTION_PREFIX)) + std::to_string(remotePosition.spineIndex + 1));
-    const std::string localChapter =
-        !localChapterName.empty() ? localChapterName
-                                  : (std::string(tr(STR_SECTION_PREFIX)) + std::to_string(currentSpineIndex + 1));
+    char localChapterFallback[32];
+    const char* localChapter = localChapterName.c_str();
+    if (localChapterName.empty()) {
+      snprintf(localChapterFallback, sizeof(localChapterFallback), "%s%d", tr(STR_SECTION_PREFIX),
+               localPosition.spineIndex + 1);
+      localChapter = localChapterFallback;
+    }
 
     char remoteVal[64];
     snprintf(remoteVal, sizeof(remoteVal), tr(STR_PAGE_OVERALL_FORMAT), remotePosition.pageNumber + 1,
              remoteProgress.percentage * 100);
     char localVal[64];
-    snprintf(localVal, sizeof(localVal), tr(STR_PAGE_TOTAL_OVERALL_FORMAT), currentPage + 1, totalPagesInSpine,
-             localProgress.percentage * 100);
+    snprintf(localVal, sizeof(localVal), tr(STR_PAGE_TOTAL_OVERALL_FORMAT), localPosition.pageNumber + 1,
+             localPosition.totalPages, localProgress.percentage * 100);
     char deviceStr[80];
     deviceStr[0] = '\0';
     if (!remoteProgress.device.empty()) {
@@ -498,7 +541,7 @@ void KOReaderSyncActivity::buildResultScreen(UiScreen& screen) {
     if (deviceStr[0] != '\0') detailLine(deviceStr);
     screen.spacer(screen.theme().spaceLg);
     labelLine(tr(STR_LOCAL_LABEL));
-    detailLine(localChapter.c_str());
+    detailLine(localChapter);
     detailLine(localVal);
 
     // Two themed action rows flowing directly below the labels (not anchored to

@@ -6,6 +6,8 @@
 enum class CssTextAlign : uint8_t { Justify = 0, Left = 1, Center = 2, Right = 3, None = 4 };
 enum class CssUnit : uint8_t { Pixels = 0, Em = 1, Rem = 2, Points = 3, Percent = 4 };
 enum class CssTextDirection : uint8_t { Ltr = 0, Rtl = 1 };
+enum class CssBackgroundRepeat : uint8_t { Repeat = 0, NoRepeat = 1 };
+enum class CssBackgroundPosition : uint8_t { TopLeft = 0, TopCenter = 1, TopRight = 2, Unsupported = 3 };
 
 // Represents a CSS length value with its unit, allowing deferred resolution to pixels
 struct CssLength {
@@ -92,6 +94,9 @@ struct CssPropertyFlags {
   uint16_t display : 1;
   uint16_t direction : 1;
   uint16_t verticalAlign : 1;
+  uint16_t backgroundImage : 1;
+  uint16_t backgroundRepeat : 1;
+  uint16_t backgroundPosition : 1;
 
   CssPropertyFlags()
       : textAlign(0),
@@ -111,23 +116,28 @@ struct CssPropertyFlags {
         imageWidth(0),
         display(0),
         direction(0),
-        verticalAlign(0) {}
+        verticalAlign(0),
+        backgroundImage(0),
+        backgroundRepeat(0),
+        backgroundPosition(0) {}
 
   [[nodiscard]] bool anySet() const {
     return textAlign || fontStyle || fontWeight || textDecoration || textIndent || marginTop || marginBottom ||
            marginLeft || marginRight || paddingTop || paddingBottom || paddingLeft || paddingRight || imageHeight ||
-           imageWidth || display || direction || verticalAlign;
+           imageWidth || display || direction || verticalAlign || backgroundImage || backgroundRepeat ||
+           backgroundPosition;
   }
 
   void clearAll() {
     textAlign = fontStyle = fontWeight = textDecoration = textIndent = 0;
     marginTop = marginBottom = marginLeft = marginRight = 0;
     paddingTop = paddingBottom = paddingLeft = paddingRight = 0;
-    imageHeight = imageWidth = display = direction = verticalAlign = 0;
+    imageHeight = imageWidth = display = direction = verticalAlign = backgroundImage = backgroundRepeat =
+        backgroundPosition = 0;
   }
 };
 
-// Cache serializes defined flags as uint32_t with bit indices 0..17.
+// Cache serializes defined flags as uint32_t with bit indices 0..20.
 static_assert(sizeof(CssPropertyFlags) <= sizeof(uint32_t),
               "CssPropertyFlags exceeds 32 bits; update cache read/write in CssParser.cpp");
 
@@ -154,6 +164,10 @@ struct CssStyle {
   CssLength imageWidth;     // Width for img when both or only width set
   CssDisplay display = CssDisplay::Block;                       // display property (Block or None)
   CssVerticalAlign verticalAlign = CssVerticalAlign::Baseline;  // vertical-align (super/sub positioning)
+  // 1-based index into CssParser's bounded background path table; zero means none.
+  uint8_t backgroundImagePath = 0;
+  CssBackgroundRepeat backgroundRepeat = CssBackgroundRepeat::Repeat;
+  CssBackgroundPosition backgroundPosition = CssBackgroundPosition::TopLeft;
 
   CssPropertyFlags defined;  // Tracks which properties were explicitly set
 
@@ -232,6 +246,18 @@ struct CssStyle {
       verticalAlign = base.verticalAlign;
       defined.verticalAlign = 1;
     }
+    if (base.defined.backgroundImage) {
+      backgroundImagePath = base.backgroundImagePath;
+      defined.backgroundImage = 1;
+    }
+    if (base.hasBackgroundRepeat()) {
+      backgroundRepeat = base.backgroundRepeat;
+      defined.backgroundRepeat = 1;
+    }
+    if (base.hasBackgroundPosition()) {
+      backgroundPosition = base.backgroundPosition;
+      defined.backgroundPosition = 1;
+    }
   }
 
   [[nodiscard]] bool hasTextAlign() const { return defined.textAlign; }
@@ -252,6 +278,9 @@ struct CssStyle {
   [[nodiscard]] bool hasDisplay() const { return defined.display; }
   [[nodiscard]] bool hasDirection() const { return defined.direction; }
   [[nodiscard]] bool hasVerticalAlign() const { return defined.verticalAlign; }
+  [[nodiscard]] bool hasBackgroundImage() const { return defined.backgroundImage && backgroundImagePath != 0; }
+  [[nodiscard]] bool hasBackgroundRepeat() const { return defined.backgroundRepeat; }
+  [[nodiscard]] bool hasBackgroundPosition() const { return defined.backgroundPosition; }
 
   void reset() {
     textAlign = CssTextAlign::Left;
@@ -265,6 +294,9 @@ struct CssStyle {
     imageHeight = imageWidth = CssLength{};
     display = CssDisplay::Block;
     verticalAlign = CssVerticalAlign::Baseline;
+    backgroundImagePath = 0;
+    backgroundRepeat = CssBackgroundRepeat::Repeat;
+    backgroundPosition = CssBackgroundPosition::TopLeft;
     defined.clearAll();
   }
 };

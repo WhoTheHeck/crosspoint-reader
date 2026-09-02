@@ -1,4 +1,8 @@
 #include <Arduino.h>
+#if defined(CROSSPOINT_DIAGNOSTICS_X3)
+#include <BatteryMonitor.h>
+#include <esp_sleep.h>
+#endif
 #include <BoardConfig.h>
 #include <Epub.h>
 #include <FontCacheManager.h>
@@ -35,6 +39,7 @@
 #include "activities/ActivityManager.h"
 #include "activities/settings/SdFirmwareUpdateActivity.h"
 #include "components/UITheme.h"
+#include "diagnostics/DiagnosticJournal.h"
 #include "fontIds.h"
 #include "images/LoadingIcon.h"
 #include "platform/UsbSerialJtagHandoff.h"
@@ -47,6 +52,9 @@ ActivityManager activityManager(renderer, mappedInputManager);
 FontDecompressor fontDecompressor;
 SdCardFontSystem sdFontSystem;
 FontCacheManager fontCacheManager(renderer.getFontMap(), renderer.getSdCardFonts());
+#if defined(CROSSPOINT_DIAGNOSTICS_X3)
+DiagnosticJournal diagnosticJournal;
+#endif
 static unsigned long allowSleepAt = 0;
 static unsigned long lastX4ProPowerClickAt = 0;
 
@@ -256,6 +264,22 @@ static bool loadSleepFrameBuffer() {
 // Enter deep sleep mode
 void enterDeepSleep(bool fromTimeout = false) {
   HalPowerManager::Lock powerLock;  // Ensure we are at normal CPU frequency for sleep preparation
+#if defined(CROSSPOINT_DIAGNOSTICS_X3)
+  if (!diagnosticJournal.healthy()) {
+    LOG_ERR("DIAG", "Deep sleep inhibited because diagnostic journal is unhealthy");
+    return;
+  }
+  if (!diagnosticJournal.recordSleepEnter(fromTimeout ? 1 : 0)) {
+    LOG_ERR("DIAG", "Deep sleep inhibited because sleep marker could not be written");
+    return;
+  }
+  const esp_err_t timerWakeResult = esp_sleep_enable_timer_wakeup(5ULL * 60ULL * 1000000ULL);
+  if (timerWakeResult != ESP_OK) {
+    LOG_ERR("DIAG", "Deep sleep inhibited because timer wake could not be armed (err=%d)",
+            static_cast<int>(timerWakeResult));
+    return;
+  }
+#endif
   APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
 
   const bool isQuickResumeSleep =
@@ -287,6 +311,13 @@ void enterDeepSleep(bool fromTimeout = false) {
     WiFi.mode(WIFI_OFF);
   }
 
+#if defined(CROSSPOINT_DIAGNOSTICS_X3)
+  diagnosticJournal.close();
+  if (diagnosticJournal.failed()) {
+    LOG_ERR("DIAG", "Deep sleep inhibited because journal close failed");
+    return;
+  }
+#endif
   halTiltSensor.deepSleep();
   display.deepSleep();
   LOG_DBG("MAIN", "Entering deep sleep");
@@ -374,7 +405,13 @@ void setup() {
   const auto wakeupReason = gpio.getWakeupReason();
   if (wakeupReason == HalGPIO::WakeupReason::PowerButton && !gpio.verifyPowerButtonWakeup()) {
     LOG_DBG("MAIN", "Power-button wake not held through verification, sleeping");
+#if defined(CROSSPOINT_DIAGNOSTICS_X3)
+    // The diagnostic journal is opened only after SD initialization. Keep the
+    // device awake until that initialization can establish the sleep guard.
+    LOG_ERR("DIAG", "Skipping pre-journal sleep while diagnostic firmware boots");
+#else
     powerManager.startDeepSleep(gpio);
+#endif
   }
 
   // X4 Pro and X4 Classic both map BTN_UP to GPIO0 — an ESP32-S3 boot strap — so
@@ -401,6 +438,21 @@ void setup() {
     activityManager.goToFullScreenMessage("SD card error", EpdFontFamily::BOLD);
     return;
   }
+
+#if defined(CROSSPOINT_DIAGNOSTICS_X3)
+  if (!diagnosticJournal.begin()) {
+    setupDisplayAndFonts(isSilentReboot);
+    activityManager.goToFullScreenMessage(tr(STR_DIAGNOSTIC_ERROR), EpdFontFamily::BOLD);
+    LOG_ERR("DIAG", "Diagnostic journal unavailable; deep sleep remains inhibited");
+    return;
+  }
+  if (!diagnosticJournal.recordBoot(static_cast<uint32_t>(esp_sleep_get_wakeup_cause()))) {
+    setupDisplayAndFonts(isSilentReboot);
+    activityManager.goToFullScreenMessage(tr(STR_DIAGNOSTIC_ERROR), EpdFontFamily::BOLD);
+    LOG_ERR("DIAG", "Boot diagnostic record failed; deep sleep remains inhibited");
+    return;
+  }
+#endif
 
   HalSystem::checkPanic();
 
@@ -589,6 +641,42 @@ void loop() {
     }
     return;
   }
+
+#if defined(CROSSPOINT_DIAGNOSTICS_X3)
+  static bool diagnosticErrorShown = false;
+  if (diagnosticJournal.failed()) {
+    // Any journal failure is latched by DiagnosticJournal. Keep the failure
+    // visible and return before activity code can request deep sleep again.
+    if (!diagnosticErrorShown) {
+      activityManager.goToFullScreenMessage(tr(STR_DIAGNOSTIC_ERROR), EpdFontFamily::BOLD);
+      diagnosticErrorShown = true;
+    }
+    return;
+  }
+  static unsigned long lastDiagnosticBatterySampleMs = 0;
+  const unsigned long diagnosticNow = millis();
+  if (lastDiagnosticBatterySampleMs == 0 || diagnosticNow - lastDiagnosticBatterySampleMs >= 1000) {
+    static const BatteryMonitor battery;
+    const BatteryMonitor::Status status = battery.readStatus();
+    DiagnosticBatterySample sample;
+    sample.supported = status.supported;
+    sample.percentageKnown = status.percentageKnown;
+    sample.millivoltsKnown = status.millivoltsKnown;
+    sample.chargingKnown = status.chargingKnown;
+    sample.externalPowerKnown = status.externalPowerKnown;
+    sample.percentage = status.percentage;
+    sample.millivolts = status.millivolts;
+    sample.charging = status.charging;
+    sample.externalPower = status.externalPower;
+    sample.pm1VinMv = status.pm1VinMv;
+    sample.pm1VinOutMv = status.pm1VinOutMv;
+    sample.pm1PowerSource = status.pm1PowerSource;
+    if (!diagnosticJournal.recordBatterySample(sample)) {
+      LOG_ERR("DIAG", "Battery sample could not be written; deep sleep inhibited");
+    }
+    lastDiagnosticBatterySampleMs = diagnosticNow;
+  }
+#endif
 
   halTiltSensor.update(SETTINGS.tiltPageTurn, SETTINGS.orientation, activityManager.isReaderActivity());
 

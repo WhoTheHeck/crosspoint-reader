@@ -6,6 +6,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "CssStyle.h"
 
@@ -50,7 +51,10 @@ class CssParser {
   };
 
   // Bump when CSS cache format or rules change; section caches are invalidated when this changes
-  static constexpr uint8_t CSS_CACHE_VERSION = 10;
+  static constexpr uint8_t CSS_CACHE_VERSION = 11;
+  static constexpr uint8_t MAX_BACKGROUND_IMAGE_PATHS = 255;
+  static constexpr uint16_t MAX_BACKGROUND_IMAGE_PATH_LENGTH = 512;
+  static constexpr uint8_t BACKGROUND_IMAGE_PATH_RESERVE = 128;
 
   explicit CssParser(std::string cachePath) : cachePath(std::move(cachePath)) {}
   ~CssParser() = default;
@@ -65,7 +69,7 @@ class CssParser {
    * @param source Open file handle to read from
    * @return Complete unless bounded storage stopped rule growth or the source was invalid
    */
-  ParseResult loadFromStream(HalFile& source);
+  ParseResult loadFromStream(HalFile& source, std::string_view stylesheetPath = {});
 
   /**
    * Look up the style for an HTML element, considering tag name and class attributes.
@@ -105,7 +109,12 @@ class CssParser {
     selectorPoolSize_ = selectorPoolCapacity_ = 0;
     styleCount_ = styleCapacity_ = 0;
     ruleGrowthStopped_ = false;
+    backgroundImagePaths_.clear();
   }
+
+  // Resolve a style's compact path-table index. The returned view remains valid
+  // until the parser is cleared or destroyed.
+  [[nodiscard]] std::string_view backgroundImagePath(const CssStyle& style) const;
 
   /**
    * Check if CSS rules cache file exists
@@ -124,7 +133,7 @@ class CssParser {
    * Save parsed CSS rules to a cache file.
    * @return true if cache was written successfully
    */
-  bool saveToCache(bool complete) const;
+  bool saveToCache(bool complete = true) const;
 
   /**
    * Load CSS rules from a cache file.
@@ -167,6 +176,8 @@ class CssParser {
   uint16_t styleCapacity_ = 0;
   bool ruleGrowthStopped_ = false;
 
+  std::vector<std::string> backgroundImagePaths_;
+
   std::string cachePath;
 
   // Internal parsing helpers
@@ -183,8 +194,11 @@ class CssParser {
   PoolResult ensureSelectorPoolCapacity(size_t needed);
   PoolResult ensureStyleCapacity(size_t needed);
   PoolResult internStyle(const CssStyle& style, uint16_t& indexOut);
-  static CssStyle parseDeclarations(std::string_view declBlock);
-  static void parseDeclarationIntoStyle(std::string_view decl, CssStyle& style);
+  CssStyle parseDeclarations(std::string_view declBlock, std::string_view stylesheetDirectory = {});
+  void parseDeclarationIntoStyle(std::string_view decl, CssStyle& style, std::string_view stylesheetDirectory);
+  static bool tryParseBackgroundImage(std::string_view val, std::string& path);
+  static bool tryParseBackgroundPosition(std::string_view val, CssBackgroundPosition& position);
+  uint8_t registerBackgroundImagePath(std::string path);
 
   // Individual property value parsers
   static CssTextAlign interpretAlignment(std::string_view val);

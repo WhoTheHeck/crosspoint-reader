@@ -3,13 +3,50 @@
 #include <Logging.h>
 #include <WiFi.h>
 #include <esp_sntp.h>
+#include <sys/time.h>
 #include <time.h>
+
+#include <cerrno>
+
+#include "HalClockTime.h"
 
 HalClock halClock;  // Singleton instance
 
 void HalClock::begin() {
   _available = _sdkRtc.begin();
   LOG_INF("CLK", _available ? "SDK RTC found" : "RTC not found");
+  if (!_available) {
+    LOG_INF("CLK", "RTC time unavailable; system clock not initialized");
+    return;
+  }
+
+  Rtc::DateTime sdkDateTime;
+  if (!_sdkRtc.now(sdkDateTime)) {
+    LOG_ERR("CLK", "RTC time unavailable or untrustworthy; system clock not initialized");
+    return;
+  }
+
+  const hal_clock_detail::RtcDateTime dateTime{sdkDateTime.year,   sdkDateTime.month,  sdkDateTime.day,
+                                               sdkDateTime.hour,   sdkDateTime.minute, sdkDateTime.second,
+                                               sdkDateTime.weekday};
+  int64_t unixSeconds = 0;
+  if (!hal_clock_detail::rtcDateTimeToUnix(dateTime, unixSeconds)) {
+    LOG_ERR("CLK", "RTC time rejected: invalid UTC calendar %04u-%02u-%02u %02u:%02u:%02u weekday=%u", sdkDateTime.year,
+            sdkDateTime.month, sdkDateTime.day, sdkDateTime.hour, sdkDateTime.minute, sdkDateTime.second,
+            sdkDateTime.weekday);
+    return;
+  }
+
+  timeval systemTime = {};
+  systemTime.tv_sec = static_cast<time_t>(unixSeconds);
+  systemTime.tv_usec = 0;
+  if (settimeofday(&systemTime, nullptr) != 0) {
+    LOG_ERR("CLK", "Failed to set system time from RTC: errno=%d", errno);
+    return;
+  }
+
+  LOG_INF("CLK", "System time initialized from RTC: %04u-%02u-%02u %02u:%02u:%02u UTC", sdkDateTime.year,
+          sdkDateTime.month, sdkDateTime.day, sdkDateTime.hour, sdkDateTime.minute, sdkDateTime.second);
 }
 
 bool HalClock::getTime(uint8_t& hour, uint8_t& minute) const {

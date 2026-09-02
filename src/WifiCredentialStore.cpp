@@ -5,6 +5,7 @@
 #include <ObfuscationUtils.h>
 
 #include <algorithm>
+#include <iterator>
 
 void WifiCredentialStore::toJson(JsonDocument& doc) const {
   std::lock_guard<std::mutex> lock(credentialMutex);
@@ -160,6 +161,14 @@ std::optional<WifiCredential> WifiCredentialStore::findCredential(const std::str
   }
 
   return std::nullopt;
+}
+
+uint16_t WifiCredentialStore::findCredentialIndex(const std::string& ssid) const {
+  std::lock_guard<std::mutex> lock(credentialMutex);
+  const auto cred = find_if(credentials.begin(), credentials.end(),
+                            [&ssid](const WifiCredential& candidate) { return candidate.ssid == ssid; });
+  if (cred == credentials.end()) return 0xffff;
+  return static_cast<uint16_t>(std::distance(credentials.begin(), cred));
 }
 
 std::optional<WifiCredential> WifiCredentialStore::getCredentialAt(const size_t index) const {

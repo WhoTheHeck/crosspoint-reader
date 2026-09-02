@@ -7,8 +7,15 @@
 #include <utility>
 #include <variant>
 
+enum class WifiCompletionReason : uint8_t {
+  Connected,
+  UserCancelled,
+  Failed,
+};
+
 struct WifiResult {
   bool connected = false;
+  WifiCompletionReason reason = WifiCompletionReason::Failed;
   std::string ssid;
   std::string ip;
 };

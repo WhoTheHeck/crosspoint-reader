@@ -6,6 +6,12 @@
 #include <string>
 #include <vector>
 
+#if defined(CROSSPOINT_DIAGNOSTICS_X3)
+#include <WiFi.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/portmacro.h>
+#endif
+
 #include "activities/Activity.h"
 #include "components/UiAppHost.h"
 #include "util/ButtonNavigator.h"
@@ -13,6 +19,16 @@
 struct Rect;
 struct ThemeMetrics;
 struct WifiCredential;
+
+enum class WifiSelectionOrigin : uint8_t {
+  General,
+  KOReaderSync,
+};
+
+enum class WifiAttemptMode : uint8_t {
+  Manual,
+  Automatic,
+};
 
 // Structure to hold WiFi network information
 struct WifiNetworkInfo {
@@ -84,6 +100,8 @@ class WifiSelectionActivity final : public Activity, private UiAppHost {
 
   // Whether to attempt auto-connect on entry
   const bool allowAutoConnect;
+  const WifiSelectionOrigin origin;
+  const uint32_t sessionId;
 
   // Whether we are attempting to auto-connect or auto-scan saved networks.
   bool autoConnecting = false;
@@ -102,6 +120,21 @@ class WifiSelectionActivity final : public Activity, private UiAppHost {
   static constexpr unsigned long CONNECTION_TIMEOUT_MS = 15000;
   static constexpr unsigned long AUTO_CONNECTION_TIMEOUT_MS = 7000;
   unsigned long connectionStartTime = 0;
+  uint32_t attemptId = 0;
+  WifiAttemptMode attemptMode = WifiAttemptMode::Manual;
+  uint16_t latestDisconnectReason = 0xffff;
+  bool latestDisconnectReasonKnown = false;
+  uint32_t presentationId = 0;
+  bool confirmRequestedWhileScanning = false;
+  bool pendingFallbackCause = false;
+  uint8_t pendingFallbackTrigger = 0;
+  bool attemptIsLastConnectedSsid = false;
+  std::string lastConnectedCandidate;
+
+#if defined(CROSSPOINT_DIAGNOSTICS_X3)
+  wifi_event_id_t disconnectCallbackHandle = 0;
+  bool disconnectCallbackRegistered = false;
+#endif
 
   // The UiAppHost app hosts the network list and the save/forget prompts
   // (themed rows and dialogs, touch routing); every other state keeps its
@@ -135,13 +168,34 @@ class WifiSelectionActivity final : public Activity, private UiAppHost {
   bool tryNextSavedNetworkFromScan();
   void handleAutoConnectFailure();
   void showNetworkListFromAutoConnect();
+  void presentNetworkList(bool automatic, uint8_t fallbackTrigger);
+  void carryFallbackCause(uint8_t fallbackTrigger);
   bool hasAttemptedAutoSsid(const std::string& ssid) const;
   std::string getSignalStrengthIndicator(int32_t rssi) const;
 
   void onComplete(bool connected);
 
+#if defined(CROSSPOINT_DIAGNOSTICS_X3)
+  struct DisconnectEvent {
+    uint16_t reason = 0;
+    uint32_t callbackUptimeMs = 0;
+    uint32_t attemptId = 0;
+    uint8_t mode = 0;
+  };
+  static constexpr size_t DISCONNECT_RING_SIZE = 8;
+  static DisconnectEvent disconnectRing[DISCONNECT_RING_SIZE];
+  static volatile uint8_t disconnectRingHead;
+  static volatile uint8_t disconnectRingCount;
+  static volatile uint8_t disconnectRingDropped;
+  static portMUX_TYPE disconnectRingMux;
+  static WifiSelectionActivity* callbackOwner;
+  static void onWifiSystemEvent(arduino_event_t* event);
+  void drainDisconnectEvents();
+#endif
+
  public:
-  explicit WifiSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, bool autoConnect = true);
+  explicit WifiSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, bool autoConnect = true,
+                                 WifiSelectionOrigin origin = WifiSelectionOrigin::General, uint32_t sessionId = 0);
   void onEnter() override;
   void onExit() override;
   void loop() override;
