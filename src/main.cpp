@@ -26,6 +26,7 @@
 
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
+#include "DeepSleep.h"
 #include "KOReaderCredentialStore.h"
 #include "MappedInputManager.h"
 #include "OpdsServerStore.h"
@@ -147,6 +148,12 @@ enum class BootResume : uint8_t {
 // device back up against the user's sleep gesture. Never cleared:
 // startDeepSleep() does not return, so a set latch only ends at the wakeup reset.
 static bool deepSleepInProgress = false;
+static bool deferredSleepPending = false;
+static bool deferredSleepCompletionRequested = false;
+static bool deferredSleepFromTimeout = false;
+static bool deferredSleepFromReader = false;
+static uint32_t deferredSleepStartedAt = 0;
+static constexpr uint32_t DEFERRED_SLEEP_GUARD_MS = 15000;
 
 #if FREEINK_CAP_TOUCH
 static bool finishWifiSessionWithoutRestart() {
@@ -253,10 +260,9 @@ static bool loadSleepFrameBuffer() {
   return true;
 }
 
-// Enter deep sleep mode
-void enterDeepSleep(bool fromTimeout = false) {
+static void commitDeepSleep(bool fromTimeout, const bool sleepScreenAlreadyShown, const bool fromReader) {
   HalPowerManager::Lock powerLock;  // Ensure we are at normal CPU frequency for sleep preparation
-  APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
+  APP_STATE.lastSleepFromReader = fromReader;
 
   const bool isQuickResumeSleep =
       SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::QUICK_RESUME ||
@@ -271,7 +277,7 @@ void enterDeepSleep(bool fromTimeout = false) {
   // Commit to sleeping before goToSleep() runs the outgoing activity's onExit():
   // a WiFi activity would otherwise silentRestart() here and reboot instead.
   deepSleepInProgress = true;
-  activityManager.goToSleep(fromTimeout);
+  if (!sleepScreenAlreadyShown) activityManager.goToSleep(fromTimeout);
 
   if (isQuickResumeSleep) {
     saveSleepFrameBuffer();
@@ -293,6 +299,27 @@ void enterDeepSleep(bool fromTimeout = false) {
   LOG_DBG("MAIN", "Entering deep sleep");
 
   powerManager.startDeepSleep(gpio);
+}
+
+// Enter deep sleep mode, allowing a reader to save and perform its bounded
+// automatic sync before the irreversible hardware teardown.
+void enterDeepSleep(bool fromTimeout) {
+  const bool fromReader = activityManager.isReaderActivity();
+  if (!deepSleepInProgress && !deferredSleepPending && activityManager.prepareForSleep(fromTimeout)) {
+    deferredSleepPending = true;
+    deferredSleepFromTimeout = fromTimeout;
+    deferredSleepFromReader = fromReader;
+    deferredSleepStartedAt = millis();
+    LOG_DBG("SLP", "Sleep deferred for reader continuation");
+    return;
+  }
+  commitDeepSleep(fromTimeout, false, fromReader);
+}
+
+void completeDeferredDeepSleep(bool /*fromTimeout*/) {
+  if (deferredSleepPending) {
+    deferredSleepCompletionRequested = true;
+  }
 }
 
 void setupDisplayAndFonts(bool seamless = false) {
@@ -553,7 +580,9 @@ void setup() {
     APP_STATE.openEpubPath = "";
     APP_STATE.readerActivityLoadCount++;
     APP_STATE.saveToFile();
-    activityManager.goToReader(path, allowFastInitialReaderRefresh);
+    activityManager.goToReader(
+        path, allowFastInitialReaderRefresh, false,
+        resume == BootResume::SplashlessWake ? KOReaderSyncTrigger::Wake : KOReaderSyncTrigger::Open);
   }
 
   if (resume == BootResume::Silent) {
@@ -583,6 +612,27 @@ void loop() {
 
   gpio.setSharedConfirmPowerShortPressEmitsPower(SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP);
   mappedInputManager.update();
+
+  // A reader may own a short, bounded pre-sleep continuation. Keep dispatching
+  // that activity and only hand the panel to SleepActivity after it reports a
+  // terminal result; network failure still reaches this same fail-closed path.
+  if (deferredSleepPending) {
+    activityManager.loop();
+    if (deferredSleepCompletionRequested ||
+        static_cast<uint32_t>(millis() - deferredSleepStartedAt) >= DEFERRED_SLEEP_GUARD_MS) {
+      const bool fromTimeout = deferredSleepFromTimeout;
+      const bool fromReader = deferredSleepFromReader;
+      if (!deferredSleepCompletionRequested) {
+        LOG_ERR("SLP", "Deferred sleep continuation exceeded %u ms", DEFERRED_SLEEP_GUARD_MS);
+      }
+      deferredSleepPending = false;
+      deferredSleepCompletionRequested = false;
+      commitDeepSleep(fromTimeout, false, fromReader);
+    } else {
+      delay(10);
+    }
+    return;
+  }
 
   if (activityManager.requiresExclusiveStorageLoop()) {
     // USB Drive handed the raw SD card to the host. Do not run screenshots,
@@ -705,7 +755,7 @@ void loop() {
       return;
     }
     LOG_DBG("MAIN", "Power button held %lums, sleeping", gpio.getPowerButtonHeldTime());
-    enterDeepSleep();
+    enterDeepSleep(false);
     // This should never be hit as `enterDeepSleep` calls esp_deep_sleep_start
     return;
   }
@@ -717,7 +767,7 @@ void loop() {
   if ((SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP ||
        SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::IGNORE) &&
       millis() >= allowSleepAt && mappedInputManager.wasReleased(MappedInputManager::Button::Power)) {
-    enterDeepSleep();
+    enterDeepSleep(false);
     return;
   }
 #endif

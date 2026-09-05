@@ -1,0 +1,3 @@
+add_executable(KOReaderAutoSyncTest KOReaderAutoSyncTest.cpp ${REPO_ROOT}/lib/KOReaderSync/KOReaderSyncSession.cpp)
+target_link_libraries(KOReaderAutoSyncTest PRIVATE crosspoint_test_common GTest::gtest_main)
+gtest_discover_tests(KOReaderAutoSyncTest)

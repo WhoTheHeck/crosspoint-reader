@@ -542,7 +542,7 @@ std::string ChapterXPathResolver::findXPathForParagraph(const std::shared_ptr<Ep
   }
 
   if (resolver.hasMatch()) {
-    LOG_DBG("KOX", "Resolved paragraph %u in spine %d -> %s", paragraphIndex, spineIndex, resolver.getXPath().c_str());
+    LOG_DBG("KOX", "Resolved paragraph %u in spine %d", paragraphIndex, spineIndex);
     return resolver.getXPath();
   }
 
@@ -590,8 +590,7 @@ std::string ChapterXPathResolver::findXPathForProgress(const std::shared_ptr<Epu
   }
 
   if (resolver.hasMatch()) {
-    LOG_DBG("KOX", "Resolved progress %.3f in spine %d -> %s", intraSpineProgress, spineIndex,
-            resolver.getXPath().c_str());
+    LOG_DBG("KOX", "Resolved progress %.3f in spine %d", intraSpineProgress, spineIndex);
     return resolver.getXPath();
   }
 

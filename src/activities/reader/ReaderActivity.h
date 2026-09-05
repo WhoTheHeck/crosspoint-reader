@@ -6,11 +6,15 @@
 #include <utility>
 
 #include "EndOfBookOptions.h"
+#include "KOReaderSyncSession.h"
 #include "activities/Activity.h"
 
 class ReaderActivity : public Activity {
  protected:
   std::string bookPath;
+  // Completion can suppress exactly the replacement reader's first automatic
+  // open check. Home, sleep, and later book-switch checks stay eligible.
+  bool suppressAutomaticOpenOnce = false;
   int pagesUntilFullRefresh = 0;
   bool forcedRefreshPending = false;
 
@@ -18,7 +22,9 @@ class ReaderActivity : public Activity {
   std::atomic<bool> endOfBookOptionsReady{false};
 
   explicit ReaderActivity(const char* name, GfxRenderer& renderer, MappedInputManager& mappedInput,
-                          std::string bookPath, bool allowFastInitialRefresh);
+                          std::string bookPath, bool allowFastInitialRefresh, bool suppressAutomaticOpenOnce,
+                          KOReaderSyncTrigger automaticTrigger);
+  KOReaderSyncTrigger automaticTrigger = KOReaderSyncTrigger::Open;
 
   virtual bool loadBook() = 0;
   virtual std::string getBookTitle() const = 0;
@@ -47,7 +53,9 @@ class ReaderActivity : public Activity {
   ~ReaderActivity() override = default;
 
   static std::unique_ptr<ReaderActivity> create(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                                                std::string path, bool allowFastInitialRefresh);
+                                                std::string path, bool allowFastInitialRefresh,
+                                                bool suppressAutomaticOpenOnce = false,
+                                                KOReaderSyncTrigger automaticTrigger = KOReaderSyncTrigger::Open);
 
   void onEnter() override;
   void onExit() override;

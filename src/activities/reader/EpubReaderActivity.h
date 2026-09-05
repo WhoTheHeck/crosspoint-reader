@@ -12,6 +12,7 @@
 
 #include "BookmarkEntry.h"
 #include "EpubReaderMenuActivity.h"
+#include "KOReaderSyncActivity.h"
 #include "ProgressMapper.h"
 #include "ReaderActivity.h"
 #include "ReaderToolbarUi.h"
@@ -52,6 +53,8 @@ class EpubReaderActivity final : public ReaderActivity {
   bool recentsEntryRemoved = false;
   unsigned long bookmarkMessageTime = 0UL;
   bool pendingReadFolderMove = false;
+  bool automaticSyncPending = false;
+  bool automaticSyncInProgress = false;
 
   // Toolbar reader menu (SETTINGS.readerMenuStyle == READER_MENU_TOOLBAR): drawn
   // over the page instead of pushing the full-screen list menu. Select opens the
@@ -150,7 +153,10 @@ class EpubReaderActivity final : public ReaderActivity {
   std::string moreRowValue(int row) const;
   void activateMoreRow(int row);
   void openDictionaryWordSelect();
-  bool launchKOReaderSync();
+  bool launchKOReaderSync(
+      bool automatic = false, KOReaderSyncTrigger trigger = KOReaderSyncTrigger::Open,
+      KOReaderSyncActivity::CompletionTarget completionTarget = KOReaderSyncActivity::CompletionTarget::READER,
+      std::string continuationPath = {});
   unsigned long confirmLongPressThreshold() const;
   void toggleAutoPageTurn(uint8_t selectedPageTurnOption);
   void loadCachedBookmarks();
@@ -177,11 +183,17 @@ class EpubReaderActivity final : public ReaderActivity {
   std::string getBookThumbBmpPath() const override { return epub ? epub->getThumbBmpPath() : ""; }
   void renderBook() override;
   void onEndOfBookRendered() override;
+  void onEnter() override;
+  void onGoHome(HomeMenuItem item = HomeMenuItem::NONE) override;
+  bool prepareForSleep(bool fromTimeout) override;
+  bool prepareForBookSwitch(const std::string& incomingPath) override;
 
  public:
   explicit EpubReaderActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string bookPath,
-                              bool allowFastInitialRefresh)
-      : ReaderActivity("EpubReader", renderer, mappedInput, std::move(bookPath), allowFastInitialRefresh) {}
+                              bool allowFastInitialRefresh, bool suppressAutomaticOpenOnce = false,
+                              KOReaderSyncTrigger automaticTrigger = KOReaderSyncTrigger::Open)
+      : ReaderActivity("EpubReader", renderer, mappedInput, std::move(bookPath), allowFastInitialRefresh,
+                       suppressAutomaticOpenOnce, automaticTrigger) {}
   ~EpubReaderActivity() override;
 
   void loop() override;

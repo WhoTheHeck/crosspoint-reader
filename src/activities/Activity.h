@@ -51,6 +51,11 @@ class Activity {
   virtual bool handleForcedRefresh() { return false; }
   virtual bool isHomeActivity() const { return false; }
   virtual bool handleHomeGesture() { return false; }
+  // Give a reader a chance to persist its position or perform a bounded
+  // background operation before the main task commits to deep sleep.
+  virtual bool prepareForSleep(bool /*fromTimeout*/) { return false; }
+  // Give a reader a chance to finish its close leg before another book opens.
+  virtual bool prepareForBookSwitch(const std::string& /*incomingPath*/) { return false; }
   virtual ScreenshotInfo getScreenshotInfo() const { return {}; }
 
   // Start a new activity without destroying the current one
@@ -65,6 +70,6 @@ class Activity {
 
   // Convenience method to facilitate API transition to ActivityManager
   // TODO: remove this in near future
-  void onGoHome(HomeMenuItem item = HomeMenuItem::NONE);
+  virtual void onGoHome(HomeMenuItem item = HomeMenuItem::NONE);
   void onSelectBook(const std::string& path);
 };

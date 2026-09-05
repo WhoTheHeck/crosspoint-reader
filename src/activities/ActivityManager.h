@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "GfxRenderer.h"
+#include "KOReaderSyncSession.h"
 #include "MappedInputManager.h"
 #include "util/ScreenshotInfo.h"
 
@@ -87,8 +88,12 @@ class ActivityManager {
   void goToFileBrowser(std::string path = {});
   void goToRecentBooks();
   void goToBrowser();
-  void goToReader(std::string path, bool allowFastInitialRefresh = false);
+  void goToReader(std::string path, bool allowFastInitialRefresh = false, bool suppressAutomaticOpenOnce = false,
+                  KOReaderSyncTrigger trigger = KOReaderSyncTrigger::Open);
   void goToSleep(bool fromTimeout = false);
+  // Let the current activity defer the final deep-sleep commit while it runs a
+  // bounded save/sync continuation. Returns true when it took ownership.
+  bool prepareForSleep(bool fromTimeout);
   void goToBoot();
   void goToFullScreenMessage(std::string message, EpdFontFamily::Style style = EpdFontFamily::REGULAR);
   void goToCrashReport();

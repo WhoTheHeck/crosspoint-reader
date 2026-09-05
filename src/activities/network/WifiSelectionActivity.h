@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -36,6 +37,8 @@ enum class WifiSelectionState {
   CONNECTION_FAILED,  // Connection failed
   FORGET_PROMPT       // Asking user if they want to forget the network
 };
+
+enum class WifiAutoConnectMode : uint8_t { Interactive, Background };
 
 /**
  * WifiSelectionActivity is responsible for scanning WiFi APs and connecting to them.
@@ -84,6 +87,8 @@ class WifiSelectionActivity final : public Activity, private UiAppHost {
 
   // Whether to attempt auto-connect on entry
   const bool allowAutoConnect;
+  const WifiAutoConnectMode autoConnectMode;
+  std::optional<uint32_t> backgroundStartedAt;
 
   // Whether we are attempting to auto-connect or auto-scan saved networks.
   bool autoConnecting = false;
@@ -93,6 +98,9 @@ class WifiSelectionActivity final : public Activity, private UiAppHost {
 
   // Saved SSIDs already attempted during the current auto-connect session.
   std::vector<std::string> autoAttemptedSsids;
+  // A direct last-used-network attempt has no scan results to fall back to.
+  // Track the background scan separately from the visible list contents.
+  bool savedNetworkScanStarted = false;
 
   // Save/forget prompt selection (0 = Yes, 1 = No)
   int savePromptSelection = 0;
@@ -101,6 +109,7 @@ class WifiSelectionActivity final : public Activity, private UiAppHost {
   // Connection timeout
   static constexpr unsigned long CONNECTION_TIMEOUT_MS = 15000;
   static constexpr unsigned long AUTO_CONNECTION_TIMEOUT_MS = 7000;
+  static constexpr unsigned long BACKGROUND_CONNECTION_TIMEOUT_MS = 15000;
   unsigned long connectionStartTime = 0;
 
   // The UiAppHost app hosts the network list and the save/forget prompts
@@ -141,7 +150,9 @@ class WifiSelectionActivity final : public Activity, private UiAppHost {
   void onComplete(bool connected);
 
  public:
-  explicit WifiSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, bool autoConnect = true);
+  explicit WifiSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, bool autoConnect = true,
+                                 WifiAutoConnectMode autoConnectMode = WifiAutoConnectMode::Interactive,
+                                 std::optional<uint32_t> backgroundStartedAt = std::nullopt);
   void onEnter() override;
   void onExit() override;
   void loop() override;

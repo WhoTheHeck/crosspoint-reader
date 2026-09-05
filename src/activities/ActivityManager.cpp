@@ -94,7 +94,8 @@ void ActivityManager::loop() {
       if (currentActivity->handleHomeGesture()) {
         return;
       }
-      goHome();
+      // Let reader activities persist/synchronize before the home transition.
+      currentActivity->onGoHome();
       return;
     }
 
@@ -262,7 +263,8 @@ void ActivityManager::goToBrowser() {
   }
 }
 
-void ActivityManager::goToReader(std::string path, const bool allowFastInitialRefresh) {
+void ActivityManager::goToReader(std::string path, const bool allowFastInitialRefresh,
+                                 const bool suppressAutomaticOpenOnce, const KOReaderSyncTrigger trigger) {
   if (path.empty()) {
     goToFileBrowser("/");
     return;
@@ -278,10 +280,23 @@ void ActivityManager::goToReader(std::string path, const bool allowFastInitialRe
     return;
   }
 
-  auto activity = ReaderActivity::create(renderer, mappedInput, std::move(path), allowFastInitialRefresh);
+  if (currentActivity && currentActivity->isReaderActivity() && currentActivity->prepareForBookSwitch(path)) {
+    return;
+  }
+
+  // Once the outgoing reader has completed its close leg, this call is the
+  // incoming reader's normal open leg. The completion path suppresses only
+  // reentry into the outgoing reader itself.
+  const auto incomingTrigger = trigger;
+  auto activity = ReaderActivity::create(renderer, mappedInput, std::move(path), allowFastInitialRefresh,
+                                         suppressAutomaticOpenOnce, incomingTrigger);
   if (activity) {
     replaceActivity(std::move(activity));
   }
+}
+
+bool ActivityManager::prepareForSleep(const bool fromTimeout) {
+  return currentActivity && currentActivity->prepareForSleep(fromTimeout);
 }
 
 void ActivityManager::goToSleep(bool fromTimeout) {

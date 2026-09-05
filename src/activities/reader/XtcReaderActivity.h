@@ -35,8 +35,10 @@ class XtcReaderActivity final : public ReaderActivity {
 
  public:
   explicit XtcReaderActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string bookPath,
-                             bool allowFastInitialRefresh)
-      : ReaderActivity("XtcReader", renderer, mappedInput, std::move(bookPath), allowFastInitialRefresh) {}
+                             bool allowFastInitialRefresh, bool suppressAutomaticOpenOnce = false,
+                             KOReaderSyncTrigger automaticTrigger = KOReaderSyncTrigger::Open)
+      : ReaderActivity("XtcReader", renderer, mappedInput, std::move(bookPath), allowFastInitialRefresh,
+                       suppressAutomaticOpenOnce, automaticTrigger) {}
   ~XtcReaderActivity() override = default;
 
   bool pageTurn(bool isForward) override;

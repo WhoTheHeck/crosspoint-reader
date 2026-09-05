@@ -4,6 +4,8 @@
 #include <MD5Builder.h>
 #include <ObfuscationUtils.h>
 
+#include "KOReaderAutoSyncSetting.h"
+
 namespace {
 // Default sync server URL. crosspoint-sync speaks the full KOSync protocol, so
 // pointing at any other kosync server (e.g. https://sync.koreader.rocks:443)
@@ -26,6 +28,7 @@ void KOReaderCredentialStore::toJson(JsonDocument& doc) const {
   doc["matchMethod"] = static_cast<uint8_t>(getMatchMethod());
   doc["sendMetadata"] = getSendMetadata();
   doc["syncBehavior"] = static_cast<uint8_t>(getSyncBehavior());
+  doc["autoSyncEnabled"] = getAutoSyncEnabled();
 }
 
 bool KOReaderCredentialStore::fromJson(JsonVariantConst doc) {
@@ -71,18 +74,24 @@ bool KOReaderCredentialStore::fromJson(JsonVariantConst doc) {
     needsResave = true;
   }
 
+  const JsonVariantConst autoSyncValue = doc["autoSyncEnabled"];
+  const bool isAutoSyncBoolean = autoSyncValue.is<bool>();
+  setAutoSyncEnabled(KOReaderAutoSyncSetting::fromStoredValue(isAutoSyncBoolean, autoSyncValue.as<bool>()));
+  if (!isAutoSyncBoolean) {
+    needsResave = true;
+  }
+
   if (needsResave) {
     LOG_DBG("KRS", "Resaving KOReader credentials to update format");
     requestResave();
   }
-
   return true;
 }
 
 void KOReaderCredentialStore::setCredentials(const std::string& user, const std::string& pass) {
   username = user;
   password = pass;
-  LOG_DBG("KRS", "Set credentials for user: %s", user.c_str());
+  LOG_DBG("KRS", "Credentials updated");
 }
 
 std::string KOReaderCredentialStore::getMd5Password() const {
@@ -150,4 +159,9 @@ void KOReaderCredentialStore::setSyncBehavior(KOReaderSyncBehavior behavior) {
   }
   syncBehavior = behavior;
   LOG_DBG("KRS", "Set sync behavior: %s", behavior == KOReaderSyncBehavior::SMART ? "Smart" : "Ask");
+}
+
+void KOReaderCredentialStore::setAutoSyncEnabled(const bool enabled) {
+  autoSyncEnabled = enabled;
+  LOG_DBG("KRS", "Set automatic progress sync: %s", enabled ? "On" : "Off");
 }

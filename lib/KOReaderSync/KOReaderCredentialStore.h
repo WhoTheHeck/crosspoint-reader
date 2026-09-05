@@ -32,6 +32,7 @@ class KOReaderCredentialStore : public PersistableStore<KOReaderCredentialStore>
   DocumentMatchMethod matchMethod = DocumentMatchMethod::FILENAME;  // Default to filename for compatibility
   bool sendMetadata = false;                                        // Send document metadata with progress sync
   KOReaderSyncBehavior syncBehavior = KOReaderSyncBehavior::SMART;
+  bool autoSyncEnabled = false;  // Background sync at reader lifecycle boundaries
 
   // Private constructor for singleton
   KOReaderCredentialStore() = default;
@@ -79,6 +80,11 @@ class KOReaderCredentialStore : public PersistableStore<KOReaderCredentialStore>
   // Sync behavior
   void setSyncBehavior(KOReaderSyncBehavior behavior);
   KOReaderSyncBehavior getSyncBehavior() const { return syncBehavior; }
+
+  // Automatic lifecycle synchronization. Disabled by default and fail-closed
+  // when an old or malformed config does not contain a boolean value.
+  void setAutoSyncEnabled(bool enabled);
+  bool getAutoSyncEnabled() const { return autoSyncEnabled; }
 };
 
 // Helper macro to access credential store

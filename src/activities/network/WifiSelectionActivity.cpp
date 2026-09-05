@@ -25,8 +25,13 @@ constexpr fui::ActionId ACTION_PROMPT = 3;
 }  // namespace
 
 WifiSelectionActivity::WifiSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                                             const bool autoConnect)
-    : Activity("WifiSelection", renderer, mappedInput), UiAppHost(renderer), allowAutoConnect(autoConnect) {}
+                                             const bool autoConnect, const WifiAutoConnectMode autoConnectMode,
+                                             const std::optional<uint32_t> backgroundStartedAt)
+    : Activity("WifiSelection", renderer, mappedInput),
+      UiAppHost(renderer),
+      allowAutoConnect(autoConnect),
+      autoConnectMode(autoConnectMode),
+      backgroundStartedAt(backgroundStartedAt) {}
 
 void WifiSelectionActivity::onRowEvent(const fui::ActionEvent& event, void* user) {
   auto* self = static_cast<WifiSelectionActivity*>(user);
@@ -112,6 +117,7 @@ void WifiSelectionActivity::onEnter() {
   autoConnecting = false;
   manualNetworkListRequested = false;
   autoAttemptedSsids.clear();
+  savedNetworkScanStarted = false;
   const size_t savedCredentialCount = WIFI_STORE.getCredentialCount();
   autoAttemptedSsids.reserve(savedCredentialCount);
 
@@ -137,8 +143,9 @@ void WifiSelectionActivity::onEnter() {
   app.on(ACTION_PROMPT, &WifiSelectionActivity::onPromptEvent, this);
   app.setScreen(&WifiSelectionActivity::listScreen, this);
 
-  // Trigger first update to show scanning message
-  requestUpdate();
+  // Trigger first update to show scanning message. Background mode is fully
+  // silent and has no picker, keyboard, or popup surface.
+  if (autoConnectMode == WifiAutoConnectMode::Interactive) requestUpdate();
 
   // Attempt to auto-connect to known networks. Try the last successful
   // network first for speed, then scan and try any visible saved networks by
@@ -153,6 +160,11 @@ void WifiSelectionActivity::onEnter() {
     }
 
     startWifiScan(true);
+    return;
+  }
+
+  if (autoConnectMode == WifiAutoConnectMode::Background) {
+    onComplete(false);
     return;
   }
 
@@ -178,6 +190,7 @@ void WifiSelectionActivity::onExit() {
 }
 
 void WifiSelectionActivity::startWifiScan(const bool autoScan) {
+  if (autoScan) savedNetworkScanStarted = true;
   autoConnecting = autoScan;
   manualNetworkListRequested = false;
   listNav.reset();
@@ -211,9 +224,13 @@ void WifiSelectionActivity::processWifiScanResults() {
     appendHiddenNetworkEntry();
     rebuildNetworkRowItems();
     autoConnecting = false;
-    state = WifiSelectionState::NETWORK_LIST;
-    selectedNetworkIndex = 0;
-    requestUpdate();
+    if (autoConnectMode == WifiAutoConnectMode::Background) {
+      onComplete(false);
+    } else {
+      state = WifiSelectionState::NETWORK_LIST;
+      selectedNetworkIndex = 0;
+      requestUpdate();
+    }
     return;
   }
 
@@ -261,6 +278,12 @@ void WifiSelectionActivity::processWifiScanResults() {
   WiFi.scanDelete();
 
   if (autoConnecting && !manualNetworkListRequested && tryNextSavedNetworkFromScan()) {
+    return;
+  }
+
+  if (autoConnectMode == WifiAutoConnectMode::Background) {
+    autoConnecting = false;
+    onComplete(false);
     return;
   }
 
@@ -425,6 +448,18 @@ void WifiSelectionActivity::handleAutoConnectFailure() {
   LOG_DBG("WIFI", "Saved network failed: %s", selectedSSID.c_str());
   WiFi.disconnect();
 
+  if (autoConnectMode == WifiAutoConnectMode::Background) {
+    if (!savedNetworkScanStarted) {
+      // The first direct attempt was the remembered SSID; scan before giving
+      // up so another reachable saved network gets the same deadline.
+      startWifiScan(true);
+      return;
+    }
+    if (tryNextSavedNetworkFromScan()) return;
+    onComplete(false);
+    return;
+  }
+
   if (!networks.empty()) {
     if (tryNextSavedNetworkFromScan()) {
       return;
@@ -565,7 +600,15 @@ void WifiSelectionActivity::checkConnectionStatus() {
   }
 
   // Check for timeout
-  const unsigned long timeoutMs = autoConnecting ? AUTO_CONNECTION_TIMEOUT_MS : CONNECTION_TIMEOUT_MS;
+  const unsigned long timeoutMs = autoConnectMode == WifiAutoConnectMode::Background
+                                      ? BACKGROUND_CONNECTION_TIMEOUT_MS
+                                      : (autoConnecting ? AUTO_CONNECTION_TIMEOUT_MS : CONNECTION_TIMEOUT_MS);
+  if (autoConnectMode == WifiAutoConnectMode::Background &&
+      (!backgroundStartedAt.has_value() || millis() - *backgroundStartedAt >= BACKGROUND_CONNECTION_TIMEOUT_MS)) {
+    WiFi.disconnect();
+    onComplete(false);
+    return;
+  }
   if (millis() - connectionStartTime > timeoutMs) {
     WiFi.disconnect();
     connectionError = tr(STR_ERROR_CONNECTION_TIMEOUT);
@@ -580,14 +623,24 @@ void WifiSelectionActivity::checkConnectionStatus() {
 }
 
 void WifiSelectionActivity::loop() {
+  if (autoConnectMode == WifiAutoConnectMode::Background && backgroundStartedAt.has_value() &&
+      millis() - *backgroundStartedAt >= BACKGROUND_CONNECTION_TIMEOUT_MS) {
+    WiFi.scanDelete();
+    WiFi.disconnect();
+    onComplete(false);
+    return;
+  }
+
   // Check scan progress
   if (state == WifiSelectionState::SCANNING) {
-    if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
+    if (autoConnectMode == WifiAutoConnectMode::Interactive &&
+        mappedInput.wasPressed(MappedInputManager::Button::Back)) {
       WiFi.scanDelete();
       onComplete(false);
       return;
     }
-    if (autoConnecting && mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
+    if (autoConnectMode == WifiAutoConnectMode::Interactive && autoConnecting &&
+        mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
       autoConnecting = false;
       manualNetworkListRequested = true;
       requestUpdate();
@@ -599,12 +652,14 @@ void WifiSelectionActivity::loop() {
   // Check connection progress
   if (state == WifiSelectionState::CONNECTING || state == WifiSelectionState::AUTO_CONNECTING) {
     if (state == WifiSelectionState::AUTO_CONNECTING) {
-      if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
+      if (autoConnectMode == WifiAutoConnectMode::Interactive &&
+          mappedInput.wasPressed(MappedInputManager::Button::Back)) {
         WiFi.disconnect();
         onComplete(false);
         return;
       }
-      if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
+      if (autoConnectMode == WifiAutoConnectMode::Interactive &&
+          mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
         showNetworkListFromAutoConnect();
         return;
       }
@@ -827,6 +882,7 @@ std::string WifiSelectionActivity::getSignalStrengthIndicator(const int32_t rssi
 }
 
 void WifiSelectionActivity::render(RenderLock&&) {
+  if (autoConnectMode == WifiAutoConnectMode::Background) return;
   // Don't render if we're in a keyboard-entry state - we're just transitioning
   // from the keyboard subactivity back to the main activity
   if (state == WifiSelectionState::PASSWORD_ENTRY || state == WifiSelectionState::HIDDEN_SSID_ENTRY) {

@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -59,6 +60,7 @@ struct KOReaderProgress {
  */
 class KOReaderSyncClient {
  public:
+  static constexpr uint32_t DEFAULT_REQUEST_TIMEOUT_MS = 15000;
   enum Error {
     OK = 0,
     NO_CREDENTIALS,
@@ -91,14 +93,15 @@ class KOReaderSyncClient {
    * @param outProgress Output: the progress data
    * @return OK on success, NOT_FOUND if no progress exists, error code on failure
    */
-  static Error getProgress(const std::string& documentHash, KOReaderProgress& outProgress);
+  static Error getProgress(const std::string& documentHash, KOReaderProgress& outProgress,
+                           uint32_t timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS);
 
   /**
    * Update reading progress for a document.
    * @param progress The progress data to upload
    * @return OK on success, error code on failure
    */
-  static Error updateProgress(const KOReaderProgress& progress);
+  static Error updateProgress(const KOReaderProgress& progress, uint32_t timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS);
 
   /**
    * Get human-readable error message.
@@ -107,4 +110,30 @@ class KOReaderSyncClient {
 
   /** HTTP status code from the last request (for diagnostics). */
   static int lastHttpCode;
+};
+
+/** Injectable transport used by one automatic GET/PUT exchange. */
+class KOReaderSyncTransport {
+ public:
+  virtual ~KOReaderSyncTransport() = default;
+  virtual uint32_t nowMs() const = 0;
+  virtual KOReaderSyncClient::Error getProgress(const std::string& documentHash, KOReaderProgress& outProgress,
+                                                uint32_t timeoutMs) = 0;
+  virtual KOReaderSyncClient::Error updateProgress(const KOReaderProgress& progress, uint32_t timeoutMs) = 0;
+};
+
+/** Secure same-host transport that keeps one HTTP/TLS client across requests. */
+class KOReaderSyncHttpSession final : public KOReaderSyncTransport {
+ public:
+  KOReaderSyncHttpSession();
+  ~KOReaderSyncHttpSession() override;
+
+  uint32_t nowMs() const override;
+  KOReaderSyncClient::Error getProgress(const std::string& documentHash, KOReaderProgress& outProgress,
+                                        uint32_t timeoutMs) override;
+  KOReaderSyncClient::Error updateProgress(const KOReaderProgress& progress, uint32_t timeoutMs) override;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl;
 };

@@ -12,9 +12,14 @@
  * CrossPoint position representation.
  */
 struct CrossPointPosition {
-  int spineIndex;                  // Current spine item (chapter) index
-  int pageNumber;                  // Current page within the spine item
-  int totalPages;                  // Total pages in the current spine item
+  int spineIndex = 0;  // Current spine item (chapter) index
+  bool hasResolvedSpineIndex = false;
+  int pageNumber = 0;  // Current page within the spine item
+  int totalPages = 1;  // Total pages in the current spine item
+  bool hasMappedPage = false;
+  // Set only when a local cache or identical layout resolved this page. A
+  // percentage-scaled page is display-only and cannot authorize auto-sync.
+  bool hasReliableMappedPage = false;
   uint32_t visibleTextOffset = 0;  // Authoritative zero-based visible codepoint offset
   bool hasVisibleTextOffset = false;
   uint16_t paragraphIndex = 0;     // 1-based synthetic paragraph index from XPath p[N]

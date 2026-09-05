@@ -47,8 +47,10 @@ class TxtReaderActivity final : public ReaderActivity {
 
  public:
   explicit TxtReaderActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string bookPath,
-                             bool allowFastInitialRefresh)
-      : ReaderActivity("TxtReader", renderer, mappedInput, std::move(bookPath), allowFastInitialRefresh) {}
+                             bool allowFastInitialRefresh, bool suppressAutomaticOpenOnce = false,
+                             KOReaderSyncTrigger automaticTrigger = KOReaderSyncTrigger::Open)
+      : ReaderActivity("TxtReader", renderer, mappedInput, std::move(bookPath), allowFastInitialRefresh,
+                       suppressAutomaticOpenOnce, automaticTrigger) {}
   ~TxtReaderActivity() override = default;
 
   bool pageTurn(bool isForward) override;

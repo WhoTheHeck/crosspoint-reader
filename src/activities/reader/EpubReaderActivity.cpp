@@ -5,6 +5,7 @@
 #include <FontCacheManager.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
+#include <HalDisplay.h>
 #include <HalFrontlight.h>
 #include <HalStorage.h>
 #include <I18n.h>
@@ -41,6 +42,7 @@
 #include "activities/settings/TextSettingsActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "images/RefreshCwIcon.h"
 #include "util/BookmarkUtil.h"
 #include "util/ButtonNavigator.h"
 #include "util/ScreenshotUtil.h"
@@ -167,6 +169,46 @@ EpubReaderActivity::~EpubReaderActivity() {
   } else {
     epub.reset();
   }
+}
+
+void EpubReaderActivity::onEnter() {
+  ReaderActivity::onEnter();
+  automaticSyncPending = !suppressAutomaticOpenOnce && KOREADER_STORE.getAutoSyncEnabled();
+  suppressAutomaticOpenOnce = false;
+  automaticSyncInProgress = false;
+}
+
+void EpubReaderActivity::onGoHome(const HomeMenuItem item) {
+  if (KOREADER_STORE.getAutoSyncEnabled() && KOREADER_STORE.hasCredentials() && epub && !automaticSyncInProgress) {
+    automaticSyncPending = false;
+    if (launchKOReaderSync(true, KOReaderSyncTrigger::Home, KOReaderSyncActivity::CompletionTarget::HOME)) return;
+  }
+  Activity::onGoHome(item);
+}
+
+bool EpubReaderActivity::prepareForBookSwitch(const std::string& incomingPath) {
+  if (!KOREADER_STORE.getAutoSyncEnabled() || !KOREADER_STORE.hasCredentials() || !epub || automaticSyncInProgress) {
+    return false;
+  }
+
+  automaticSyncPending = false;
+  automaticSyncInProgress = true;
+  if (launchKOReaderSync(true, KOReaderSyncTrigger::Close, KOReaderSyncActivity::CompletionTarget::BOOK_SWITCH,
+                         incomingPath)) {
+    return true;
+  }
+  automaticSyncInProgress = false;
+  return false;
+}
+
+bool EpubReaderActivity::prepareForSleep(const bool /*fromTimeout*/) {
+  if (!KOREADER_STORE.getAutoSyncEnabled() || !KOREADER_STORE.hasCredentials() || !epub || automaticSyncInProgress) {
+    return false;
+  }
+
+  automaticSyncPending = false;
+  automaticSyncInProgress = true;
+  return launchKOReaderSync(true, KOReaderSyncTrigger::Sleep, KOReaderSyncActivity::CompletionTarget::SLEEP);
 }
 
 bool EpubReaderActivity::loadBook() {
@@ -318,6 +360,18 @@ void EpubReaderActivity::loop() {
   if (!epub) {
     finish();
     return;
+  }
+
+  // The first automatic exchange is deliberately queued until renderBook()
+  // has completed one page paint. This keeps opening/wake work off the blank
+  // loading frame and makes the operation a true background continuation.
+  if (automaticSyncPending && lastRenderCompleteMs != 0 && !RenderLock::peek()) {
+    automaticSyncPending = false;
+    automaticSyncInProgress = true;
+    if (launchKOReaderSync(true, automaticTrigger, KOReaderSyncActivity::CompletionTarget::READER)) {
+      return;
+    }
+    automaticSyncInProgress = false;
   }
 
   // Someone else turned the screen while this reader was stacked (the control
@@ -923,7 +977,9 @@ unsigned long EpubReaderActivity::confirmLongPressThreshold() const {
   }
 }
 
-bool EpubReaderActivity::launchKOReaderSync() {
+bool EpubReaderActivity::launchKOReaderSync(const bool automatic, const KOReaderSyncTrigger trigger,
+                                            const KOReaderSyncActivity::CompletionTarget completionTarget,
+                                            std::string continuationPath) {
   if (!KOREADER_STORE.hasCredentials()) return false;
 
   const int currentPage = section ? section->currentPage : nextPageNumber;
@@ -939,15 +995,57 @@ bool EpubReaderActivity::launchKOReaderSync() {
 
   CrossPointPosition localPos = getCurrentPosition();
   SavedProgressPosition localKoPos = ProgressMapper::toSavedProgress(epub, localPos);
+  std::optional<KOReaderMetadata> localMetadata;
+  if (KOREADER_STORE.getSendMetadata()) {
+    KOReaderMetadata metadata;
+    const auto lastSlash = bookPath.rfind('/');
+    metadata.filename = (lastSlash != std::string::npos) ? bookPath.substr(lastSlash + 1) : bookPath;
+    metadata.title = epub->getTitle();
+    metadata.authors = epub->getAuthor();
+    localMetadata = std::move(metadata);
+  }
   const int tocIdx = epub->getTocIndexForSpineIndex(currentSpineIndex);
   std::string localChapterName = (tocIdx >= 0) ? epub->getTocItem(tocIdx).title : "";
   const std::string savedEpubPath = epub->getPath();
 
   if (!saveProgress(currentSpineIndex, currentPage, totalPages)) {
     LOG_ERR("KOSync", "Aborting sync because current progress could not be saved");
+    if (automatic && completionTarget == KOReaderSyncActivity::CompletionTarget::SLEEP) {
+      // The main task has not transferred sleep ownership unless this method
+      // returns true. A failed pre-sleep save must therefore fall straight
+      // through to the normal hardware-sleep path without waiting for input.
+      automaticSyncInProgress = false;
+      return false;
+    }
+    if (automatic && completionTarget == KOReaderSyncActivity::CompletionTarget::BOOK_SWITCH) {
+      // A failed close snapshot must not strand a requested book switch. Keep
+      // this reader marked in-progress so the manager bypasses a second close
+      // attempt while it replaces us with the incoming reader.
+      LOG_DBG("KOSync", "Auto terminal trigger=%u action=book-switch-open result=save-failed",
+              static_cast<unsigned>(trigger));
+      activityManager.goToReader(std::move(continuationPath), false, false, KOReaderSyncTrigger::Open);
+      return true;
+    }
     pendingSyncSaveError = true;
     requestUpdate();
     return true;
+  }
+
+  if (automatic) {
+    // Keep the acknowledgement in the panel's fixed lower-left corner rather
+    // than rotating it with the reader page.
+    RenderLock lock;
+    const auto originalOrientation = renderer.getOrientation();
+    renderer.setOrientation(GfxRenderer::Orientation::Portrait);
+    const int pageHeight = renderer.getScreenHeight();
+    renderer.drawImage(RefreshCwIcon, 0, pageHeight - REFRESH_CW_ICON_HEIGHT, REFRESH_CW_ICON_WIDTH,
+                       REFRESH_CW_ICON_HEIGHT);
+    renderer.setOrientation(originalOrientation);
+    if (gpio.deviceIsX3()) {
+      renderer.displayGrayscaleBase(HalDisplay::FAST_REFRESH);
+    } else {
+      renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+    }
   }
 
   LOG_DBG("KOSync", "Releasing epub for sync (heap before: %u)", (unsigned)ESP.getFreeHeap());
@@ -963,8 +1061,10 @@ bool EpubReaderActivity::launchKOReaderSync() {
   LOG_DBG("KOSync", "Epub released (heap after: %u)", (unsigned)ESP.getFreeHeap());
 
   activityManager.replaceActivity(std::make_unique<KOReaderSyncActivity>(
-      renderer, mappedInput, savedEpubPath, currentSpineIndex, currentPage, totalPages, std::move(localKoPos),
-      std::move(localChapterName), paragraphIndex));
+      renderer, mappedInput, savedEpubPath, currentSpineIndex, currentPage, totalPages, std::move(localKoPos), localPos,
+      std::move(localMetadata), std::move(localChapterName), paragraphIndex,
+      automatic ? KOReaderSyncActivity::Mode::AUTOMATIC : KOReaderSyncActivity::Mode::MANUAL,
+      automatic ? trigger : KOReaderSyncTrigger::Manual, completionTarget, std::move(continuationPath)));
   return true;
 }
 
@@ -1148,8 +1248,7 @@ void EpubReaderActivity::renderBook() {
   const ReaderRenderSpec renderSpec = SETTINGS.readerRenderSpec(viewportWidth, viewportHeight);
 
   if (!section) {
-    const auto filepath = epub->getSpineItem(currentSpineIndex).href;
-    LOG_DBG("ERS", "Loading file: %s, index: %d", filepath.c_str(), currentSpineIndex);
+    LOG_DBG("ERS", "Loading spine item, index: %d", currentSpineIndex);
     section = std::unique_ptr<Section>(new Section(epub, currentSpineIndex, renderer));
     partialRebuildStartFailed = false;
 
@@ -2578,7 +2677,13 @@ CrossPointPosition EpubReaderActivity::getCurrentPosition() const {
     }
   }
 
-  CrossPointPosition localPos = {currentSpineIndex, currentPage, totalPages};
+  CrossPointPosition localPos{};
+  localPos.spineIndex = currentSpineIndex;
+  localPos.hasResolvedSpineIndex = currentSpineIndex >= 0;
+  localPos.pageNumber = currentPage;
+  localPos.totalPages = totalPages;
+  localPos.hasMappedPage = totalPages > 0 && currentPage >= 0 && currentPage < totalPages;
+  localPos.hasReliableMappedPage = localPos.hasMappedPage;
   if (section && currentPage >= 0 && currentPage < section->pageCount) {
     if (const auto offset = section->getVisibleTextOffsetForPage(static_cast<uint16_t>(currentPage))) {
       localPos.visibleTextOffset = *offset;
