@@ -246,8 +246,7 @@ void KOReaderSyncActivity::performSync() {
         // toCrossPoint above already tried koPos.xpath; if the rich position carries the same XPath,
         // tell fromRichPosition to skip re-resolving it and use its page hints directly.
         const bool sameXPath = progress.position->xpath == progress.progress;
-        if (const auto richMapped =
-                ProgressMapper::fromRichPosition(epub, *progress.position, renderer, sameXPath)) {
+        if (const auto richMapped = ProgressMapper::fromRichPosition(epub, *progress.position, renderer, sameXPath)) {
           mapped = *richMapped;
         }
       }
