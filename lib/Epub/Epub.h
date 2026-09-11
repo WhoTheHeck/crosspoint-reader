@@ -35,7 +35,7 @@ class Epub {
   bool parseTocNcxFile() const;
   bool parseTocNavFile() const;
   void discoverCssFilesFromZip();
-  void parseCssFiles() const;
+  CssParser::ParseResult parseCssFiles(CssParser::CacheStatus existingCacheStatus) const;
 
  public:
   explicit Epub(std::string filepath, const std::string& cacheDir) : filepath(std::move(filepath)) {
@@ -52,8 +52,8 @@ class Epub {
   const std::string& getTitle() const;
   const std::string& getAuthor() const;
   const std::string& getLanguage() const;
-  std::string getCoverBmpPath(bool cropped = false) const;
-  bool generateCoverBmp(bool cropped = false) const;
+  std::string getCoverBmpPath(bool cropped = false, bool originalThresholds = false) const;
+  bool generateCoverBmp(bool cropped = false, bool originalThresholds = false) const;
   std::string getThumbBmpPath() const;
   std::string getThumbBmpPath(int height) const;
   bool generateThumbBmp(int height) const;

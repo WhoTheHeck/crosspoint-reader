@@ -43,6 +43,7 @@ class GfxRenderer {
 
   HalDisplay& display;
   RenderMode renderMode;
+  mutable bool absoluteGrayPlanes = false;
   Orientation orientation;
   bool fadingFix;
   uint8_t* frameBuffer = nullptr;
@@ -63,6 +64,13 @@ class GfxRenderer {
   // recording to the (non-const) FontCacheManager. Same pragmatic compromise
   // as before, concentrated in a single pointer instead of four fields.
   mutable FontCacheManager* fontCacheManager_ = nullptr;
+
+  // One-shot refresh promotion (see promoteNextRefresh). Mutable because
+  // displayBuffer() is const but must consume the flag.
+  mutable bool promotedRefreshPending_ = false;
+  mutable HalDisplay::RefreshMode promotedRefresh_ = HalDisplay::FAST_REFRESH;
+  // Swap in (and clear) the promoted mode, if one is pending.
+  HalDisplay::RefreshMode applyPromotedRefresh(HalDisplay::RefreshMode refreshMode) const;
 
   // Tiled grayscale strip target. When active, drawPixel()/clearScreen()
   // operate on a caller-owned scratch holding one horizontal band of physical
@@ -187,6 +195,15 @@ class GfxRenderer {
   int getScreenHeight() const;
   void tapToLogical(float nx, float ny, int& outX, int& outY) const;
   void displayBuffer(HalDisplay::RefreshMode refreshMode = HalDisplay::FAST_REFRESH) const;
+  // One-shot: the next displayBuffer()/displayBufferAsync() call uses `mode`
+  // instead of what its caller asked for, then the override clears itself.
+  // Lets a closing overlay (the control center's refresh tile) hand a
+  // ghost-cleanup waveform to the repaint of whatever screen is underneath,
+  // which it cannot reach directly.
+  void promoteNextRefresh(const HalDisplay::RefreshMode mode) const {
+    promotedRefreshPending_ = true;
+    promotedRefresh_ = mode;
+  }
   // Non-blocking refresh: starts the waveform and returns so CPU work (e.g.
   // grayscale strip rendering) can overlap the panel's refresh time. The
   // framebuffer must stay untouched until waitRefreshComplete(). Falls back to
@@ -198,6 +215,12 @@ class GfxRenderer {
   // fadingFix isn't forcing the blocking path. Callers can skip overlap
   // scaffolding (e.g. whole-plane grayscale buffers) when false.
   bool supportsAsyncRefresh() const;
+  // True when the display can overlap an ordinary B/W refresh with grayscale
+  // composition without bypassing a required grayscale base waveform.
+  HalDisplay::GrayscaleCapabilities grayscaleCapabilities(
+      HalDisplay::GrayscaleMode mode = HalDisplay::GrayscaleMode::Overlay) const;
+  // Compatibility queries for Overlay mode.
+  bool supportsAsyncGrayscaleBase() const;
   // EXPERIMENTAL: Windowed update - display only a rectangular region
   // void displayWindow(int x, int y, int width, int height) const;
   void invertScreen() const;
@@ -247,9 +270,9 @@ class GfxRenderer {
                        bool roundBottomLeft, bool roundBottomRight, Color color) const;
   void drawImage(const uint8_t bitmap[], int x, int y, int width, int height) const;
   void drawIcon(const uint8_t bitmap[], int x, int y, int size) const;
-  void drawBitmap(const Bitmap& bitmap, int x, int y, int maxWidth, int maxHeight, float cropX = 0,
+  bool drawBitmap(const Bitmap& bitmap, int x, int y, int maxWidth, int maxHeight, float cropX = 0,
                   float cropY = 0) const;
-  void drawBitmap1Bit(const Bitmap& bitmap, int x, int y, int maxWidth, int maxHeight) const;
+  bool drawBitmap1Bit(const Bitmap& bitmap, int x, int y, int maxWidth, int maxHeight) const;
   // Counter-invert content images in the logical framebuffer so output-level
   // dark mode leaves their original polarity unchanged.
   void preserveImagePolarity(int x, int y, int width, int height) const;
@@ -298,7 +321,7 @@ class GfxRenderer {
   int getTextHeight(int fontId) const;
 
   // Grayscale functions
-  void setRenderMode(const RenderMode mode) { this->renderMode = mode; }
+  void setRenderMode(RenderMode mode);
   RenderMode getRenderMode() const { return renderMode; }
   // Grayscale preconditioning settle pass (no-op on X4). The rect overload
   // takes the gray region in LOGICAL screen coordinates and rotates it to the
@@ -310,9 +333,13 @@ class GfxRenderer {
   // follows (X3: OEM differential base waveform; others: plain display with
   // `fallback`).
   void displayGrayscaleBase(HalDisplay::RefreshMode fallback = HalDisplay::HALF_REFRESH) const;
+  bool displayGrayscaleBase(HalDisplay::GrayscaleMode mode,
+                            HalDisplay::RefreshMode fallback = HalDisplay::HALF_REFRESH) const;
   void copyGrayscaleLsbBuffers() const;
   void copyGrayscaleMsbBuffers() const;
   void displayGrayBuffer() const;
+  // Active input encoding, used when drawing monochrome overlays into planes.
+  bool grayPlanesAreAbsolute() const { return absoluteGrayPlanes; }
 
   // Tiled grayscale (X4): stream one band of a plane straight to controller RAM
   // from `scratch` (panelWidthBytes * numRows, physical rows [yStart, yStart+
@@ -322,8 +349,17 @@ class GfxRenderer {
   // Paper Mono: the base activation is deferred so base + gray planes go out
   // as one waveform. Route the base through displayGrayscaleBase() when true.
   bool combinesGrayscaleBase() const;
-  bool storeBwBuffer();    // Returns true if buffer was stored successfully
-  void restoreBwBuffer();  // Restore and free the stored buffer
+  bool storeBwBuffer();  // Returns true if buffer was stored successfully
+  // Restore and free the stored buffer. resyncPanelBaseline rewrites the
+  // controller's differential baseline to the restored frame — correct after
+  // a grayscale render (the glass matches the stored BW plane), WRONG when
+  // the glass shows content painted after the store (overlay chrome): the
+  // next differential would treat that content as already erased and leave
+  // it on the glass. Such callers pass false so the baseline keeps tracking
+  // what was last pushed.
+  void restoreBwBuffer(bool resyncPanelBaseline = true);
+  // Free a stored buffer without restoring it (the page under it changed).
+  void discardStoredBwBuffer() { freeBwBufferChunks(); }
   void cleanupGrayscaleWithFrameBuffer() const;
 
   // Font helpers
